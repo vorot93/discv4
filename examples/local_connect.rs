@@ -3,8 +3,8 @@ use futures::{
     future::{self, Loop},
     Future, Sink, Stream,
 };
-use rand::os::OsRng;
-use secp256k1::{key::SecretKey, SECP256K1};
+use k256::ecdsa::SigningKey;
+use rand::rngs::OsRng;
 use std::time::Duration;
 use tokio_core::reactor::Core;
 use tokio_timer::{wheel, TimeoutError};
@@ -37,7 +37,7 @@ fn main() {
     let client = DPTStream::new(
         addr,
         &handle,
-        SecretKey::new(&SECP256K1, &mut OsRng::new().unwrap()),
+        SigningKey::random(&mut OsRng),
         BOOTSTRAP_NODES
             .iter()
             .map(|v| DPTNode::from_url(&Url::parse(v).unwrap()).unwrap())

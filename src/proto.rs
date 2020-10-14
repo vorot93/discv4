@@ -3,8 +3,13 @@ use crate::{
     PeerId,
 };
 use bigint::H256;
-use secp256k1::{key::SecretKey, Message, RecoverableSignature, RecoveryId, SECP256K1};
-use std::{convert::TryFrom, io, net::SocketAddr};
+use k256::ecdsa::{
+    recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
+    signature::{DigestSigner, Signature as _},
+    Signature, SigningKey,
+};
+use sha3::{Digest, Keccak256};
+use std::{io, net::SocketAddr};
 use tokio_core::net::UdpCodec;
 
 macro_rules! try_none {
@@ -17,7 +22,7 @@ macro_rules! try_none {
 }
 
 pub struct DPTCodec {
-    secret_key: SecretKey,
+    secret_key: SigningKey,
 }
 
 pub struct DPTCodecMessage {
@@ -27,7 +32,7 @@ pub struct DPTCodecMessage {
 }
 
 impl DPTCodec {
-    pub const fn new(secret_key: SecretKey) -> Self {
+    pub const fn new(secret_key: SigningKey) -> Self {
         Self { secret_key }
     }
 }
@@ -47,15 +52,13 @@ impl UdpCodec for DPTCodec {
             return Ok(None);
         }
 
-        let sighash = keccak256(&buf[97..]);
-        let rec_id = try_none!(RecoveryId::from_i32(i32::from(buf[96])));
-        let rec_sig = try_none!(RecoverableSignature::from_compact(
-            &SECP256K1,
-            &buf[32..96],
+        let rec_id = try_none!(RecoveryId::new(buf[96]));
+        let rec_sig = try_none!(RecoverableSignature::new(
+            &try_none!(Signature::from_bytes(&buf[32..96])),
             rec_id
         ));
-        let message = try_none!(Message::from_slice(&sighash));
-        let public_key = try_none!(SECP256K1.recover(&message, &rec_sig));
+        let public_key =
+            try_none!(rec_sig.recover_verify_key_from_digest(Keccak256::new().chain(&buf[97..])));
         let remote_id = pk2id(&public_key);
 
         let typ = buf[97];
@@ -80,25 +83,14 @@ impl UdpCodec for DPTCodec {
         typdata.push(msg.typ);
         typdata.append(&mut msg.data);
 
-        let sighash = keccak256(&typdata);
-        let message = Message::from_slice(&sighash).unwrap();
-        let rec_sig = &SECP256K1
-            .sign_recoverable(&message, &self.secret_key)
-            .unwrap();
-        let (rec, sig) = rec_sig.serialize_compact(&SECP256K1);
+        let signature: RecoverableSignature = self
+            .secret_key
+            .sign_digest(Keccak256::new().chain(&typdata));
 
-        let mut hashdata = Vec::new();
-        for d in sig.as_ref() {
-            hashdata.push(*d);
-        }
-        hashdata.push(u8::try_from(rec.to_i32()).expect("always u8"));
+        let mut hashdata = signature.as_bytes().to_vec();
         hashdata.append(&mut typdata);
 
-        let hash = keccak256(&hashdata);
-
-        for i in 0..32 {
-            buf.push(hash[i]);
-        }
+        buf.extend_from_slice(Keccak256::digest(&hashdata).as_slice());
         buf.append(&mut hashdata);
 
         msg.addr

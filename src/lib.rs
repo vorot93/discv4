@@ -12,12 +12,9 @@ use crate::{
 use bigint::{H256, H512};
 use chrono::Utc;
 use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
-use rand::{thread_rng, Rng};
+use k256::ecdsa::SigningKey;
+use rand::{prelude::*, rngs::OsRng};
 use rlp::UntrustedRlp;
-use secp256k1::{
-    key::{PublicKey, SecretKey},
-    SECP256K1,
-};
 use std::{
     convert::TryFrom,
     io,
@@ -108,20 +105,12 @@ impl DPTStream {
     pub fn new(
         addr: SocketAddr,
         handle: &Handle,
-        secret_key: SecretKey,
+        secret_key: SigningKey,
         bootstrap_nodes: Vec<DPTNode>,
         public_address: IpAddr,
         tcp_port: u16,
     ) -> Result<Self, io::Error> {
-        let id = pk2id(&match PublicKey::from_secret_key(&SECP256K1, &secret_key) {
-            Ok(val) => val,
-            Err(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "converting pub key failed",
-                ))
-            }
-        });
+        let id = pk2id(&secret_key.verify_key());
         debug!("self id: {:x}", id);
         Ok(Self {
             stream: UdpSocket::bind(&addr, handle)?.framed(DPTCodec::new(secret_key)),
@@ -386,7 +375,7 @@ impl Sink for DPTStream {
         match message {
             DPTMessage::RequestNewPeer => {
                 debug!("randomly selecting one peer from {}", self.pingponged.len());
-                thread_rng().shuffle(&mut self.pingponged);
+                self.pingponged.shuffle(&mut OsRng);
 
                 if self.pingponged.is_empty() {
                     debug!("no peers available to find node");
