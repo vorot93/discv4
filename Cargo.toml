@@ -1,0 +1,28 @@
+[package]
+name = "discv4"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = [
+    "Artem Vorotnikov <artem@vorotnikov.me>",
+    "Wei Tang <hi@that.world>",
+]
+description = "Ethereum's Node Discovery v4."
+repository = "https://github.com/rust-ethereum/discv4"
+edition = "2018"
+
+[dependencies]
+etcommon-bigint = "0.2"
+etcommon-rlp = "0.2"
+futures = "0.1"
+log = "0.3"
+rand = "0.3.12"
+secp256k1-plus = "0.5"
+sha3 = "0.6"
+time = "0.1"
+tokio-core = "0.1"
+tokio-io = "0.1"
+tokio-timer-plus = "0.1"
+url = "1.5.1"
+
+[dev-dependencies]
+env_logger = "0.3"
