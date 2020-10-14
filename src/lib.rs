@@ -10,6 +10,7 @@ use crate::{
     util::pk2id,
 };
 use bigint::{H256, H512};
+use chrono::Utc;
 use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use rand::{thread_rng, Rng};
 use rlp::UntrustedRlp;
@@ -156,8 +157,7 @@ impl DPTStream {
     }
 
     fn default_expire() -> u64 {
-        u64::try_from(time::now_utc().to_timespec().sec)
-            .expect("this would predate the protocol inception")
+        u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception")
             + 60
     }
 
