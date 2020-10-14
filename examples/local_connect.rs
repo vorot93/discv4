@@ -1,13 +1,9 @@
 use discv4::{DPTMessage, DPTNode, DPTStream};
-use futures::{
-    future::{self, Loop},
-    Future, Sink, Stream,
-};
+use futures::{compat::*, FutureExt, SinkExt, TryFutureExt, TryStreamExt};
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use std::time::Duration;
-use tokio_core::reactor::Core;
-use tokio_timer::{wheel, TimeoutError};
+use tokio::timer::Timeout;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -32,62 +28,42 @@ fn main() {
         .init();
 
     let addr = "0.0.0.0:50505".parse().unwrap();
-    let mut core = Core::new().unwrap();
-    let handle = core.handle();
-    let client = DPTStream::new(
-        addr,
-        &handle,
-        SigningKey::random(&mut OsRng),
-        BOOTSTRAP_NODES
-            .iter()
-            .map(|v| DPTNode::from_url(&Url::parse(v).unwrap()).unwrap())
-            .collect(),
-        "127.0.0.1".parse().unwrap(),
-        50505,
-    )
-    .unwrap();
+
+    let mut client = Box::pin(Compat01As03Sink::new(
+        DPTStream::new(
+            addr,
+            SigningKey::random(&mut OsRng),
+            BOOTSTRAP_NODES
+                .iter()
+                .map(|v| DPTNode::from_url(&Url::parse(v).unwrap()).unwrap())
+                .collect(),
+            "127.0.0.1".parse().unwrap(),
+            50505,
+        )
+        .unwrap(),
+    ));
 
     const SEC: u64 = 5;
     const DUR: u32 = 500;
 
-    let cycle = future::loop_fn(
-        wheel()
-            .build()
-            .timeout_stream(client, Duration::new(SEC, DUR)),
-        |client| {
-            client.into_future().then(
-                |val| -> Box<dyn Future<Item = _, Error = _> + Send + 'static> {
-                    match val {
-                        Ok((peer, timeout_client)) => {
-                            println!("new peer: {:?}", peer);
-                            Box::new(future::ok(Loop::Continue(wheel().build().timeout_stream(
-                                timeout_client.into_inner(),
-                                Duration::new(SEC, DUR),
-                            ))))
-                        }
-                        Err((TimeoutError::TimedOut(client), ..)) => {
-                            println!("timed out, requesting new peer ...");
-                            Box::new(client.send(DPTMessage::RequestNewPeer).and_then(|client| {
-                                Ok(Loop::Continue(
-                                    wheel()
-                                        .build()
-                                        .timeout_stream(client, Duration::new(SEC, DUR)),
-                                ))
-                            }))
-                        }
-                        Err((TimeoutError::Inner(err), ..)) => {
-                            println!("{:?}", err);
-                            Box::new(future::ok(Loop::Break(TimeoutError::Inner(err))))
-                        }
-                        Err((err, ..)) => {
-                            println!("{:?}", err);
-                            Box::new(future::ok(Loop::Break(err)))
-                        }
+    tokio_compat::run_std(async move {
+        loop {
+            match Timeout::new(client.try_next().boxed().compat(), Duration::new(SEC, DUR))
+                .compat()
+                .await
+            {
+                Ok(peer) => {
+                    println!("new peer: {:?}", peer);
+                }
+                Err(err) => {
+                    if err.is_elapsed() {
+                        println!("timed out, requesting new peer ...");
+                        client.send(DPTMessage::RequestNewPeer).await.unwrap();
+                    } else {
+                        panic!(err);
                     }
-                },
-            )
-        },
-    );
-
-    core.run(cycle).unwrap();
+                }
+            }
+        }
+    })
 }

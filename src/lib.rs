@@ -10,7 +10,9 @@ use crate::{
     util::pk2id,
 };
 use chrono::Utc;
-use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
+use futures01::{
+    Async, AsyncSink, Future, Poll as Poll01, Sink as Sink01, StartSend, Stream as Stream01,
+};
 use k256::ecdsa::SigningKey;
 use primitive_types::{H256, H512};
 use rand::{prelude::*, rngs::OsRng};
@@ -21,9 +23,9 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
 };
-use tokio_core::{
+use tokio::{
     net::{UdpFramed, UdpSocket},
-    reactor::{Handle, Timeout},
+    timer::Delay,
 };
 use tracing::*;
 use url::{Host, Url};
@@ -33,7 +35,7 @@ pub type PeerId = H512;
 /// DPT message for requesting new peers or ping with timeout
 pub enum DPTMessage {
     RequestNewPeer,
-    Ping(Timeout),
+    Ping(Delay),
 }
 
 /// DPT stream for sending DPT messages or receiving new peers
@@ -43,7 +45,7 @@ pub struct DPTStream {
     connected: Vec<DPTNode>,
     pingponged: Vec<DPTNode>,
     bootstrapped: bool,
-    timeout: Option<(Timeout, Vec<PeerId>)>,
+    timeout: Option<(Delay, Vec<PeerId>)>,
     incoming: Vec<DPTNode>,
     address: IpAddr,
     udp_port: u16,
@@ -104,7 +106,6 @@ impl DPTStream {
     /// Create a new DPT stream
     pub fn new(
         addr: SocketAddr,
-        handle: &Handle,
         secret_key: SigningKey,
         bootstrap_nodes: Vec<DPTNode>,
         public_address: IpAddr,
@@ -113,7 +114,7 @@ impl DPTStream {
         let id = pk2id(&secret_key.verify_key());
         debug!("self id: {:x}", id);
         Ok(Self {
-            stream: UdpSocket::bind(&addr, handle)?.framed(DPTCodec::new(secret_key)),
+            stream: UdpFramed::new(UdpSocket::bind(&addr)?, DPTCodec::new(secret_key)),
             id,
             connected: bootstrap_nodes.clone(),
             incoming: bootstrap_nodes,
@@ -150,7 +151,7 @@ impl DPTStream {
             + 60
     }
 
-    fn send_ping(&mut self, addr: SocketAddr, to: DPTNode) -> Poll<(), io::Error> {
+    fn send_ping(&mut self, addr: SocketAddr, to: DPTNode) -> Poll01<(), io::Error> {
         let typ = 0x01_u8;
         let message = PingMessage {
             from: Endpoint {
@@ -168,13 +169,13 @@ impl DPTStream {
         let data = rlp::encode(&message).to_vec();
 
         self.stream
-            .start_send(DPTCodecMessage { typ, data, addr })?;
+            .start_send((DPTCodecMessage { typ, data }, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
-    fn send_pong(&mut self, addr: SocketAddr, echo: H256, to: Endpoint) -> Poll<(), io::Error> {
+    fn send_pong(&mut self, addr: SocketAddr, echo: H256, to: Endpoint) -> Poll01<(), io::Error> {
         let typ = 0x02_u8;
         let message = PongMessage {
             echo,
@@ -185,13 +186,13 @@ impl DPTStream {
 
         debug!("sending pong ...");
         self.stream
-            .start_send(DPTCodecMessage { typ, data, addr })?;
+            .start_send((DPTCodecMessage { typ, data }, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
-    fn send_find_neighbours(&mut self, addr: SocketAddr) -> Poll<(), io::Error> {
+    fn send_find_neighbours(&mut self, addr: SocketAddr) -> Poll01<(), io::Error> {
         let typ = 0x03_u8;
         let message = FindNeighboursMessage {
             id: self.id,
@@ -200,13 +201,13 @@ impl DPTStream {
         let data = rlp::encode(&message).to_vec();
 
         self.stream
-            .start_send(DPTCodecMessage { typ, data, addr })?;
+            .start_send((DPTCodecMessage { typ, data }, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
-    fn send_neighbours(&mut self, addr: SocketAddr) -> Poll<(), io::Error> {
+    fn send_neighbours(&mut self, addr: SocketAddr) -> Poll01<(), io::Error> {
         let typ = 0x04_u8;
         // Return at most 3 nodes at a time.
         let mut nodes = Vec::new();
@@ -234,18 +235,18 @@ impl DPTStream {
         let data = rlp::encode(&message).to_vec();
 
         self.stream
-            .start_send(DPTCodecMessage { typ, data, addr })?;
+            .start_send((DPTCodecMessage { typ, data }, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 }
 
-impl Stream for DPTStream {
+impl Stream01 for DPTStream {
     type Item = DPTNode;
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+    fn poll(&mut self) -> Poll01<Option<Self::Item>, Self::Error> {
         if !self.bootstrapped {
             for node in self.connected.clone() {
                 self.send_ping(node.udp_addr(), node)?;
@@ -259,7 +260,7 @@ impl Stream for DPTStream {
             timeoutted = match timeout.poll() {
                 Ok(Async::Ready(())) => true,
                 Ok(Async::NotReady) => false,
-                Err(e) => return Err(e),
+                Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e)),
             };
 
             if timeoutted {
@@ -274,9 +275,9 @@ impl Stream for DPTStream {
         }
 
         loop {
-            let (message, remote_id, hash) = match self.stream.poll()? {
-                Async::Ready(Some(Some(val))) => val,
-                Async::Ready(Some(None)) => continue,
+            let ((message, remote_id, hash), addr) = match self.stream.poll()? {
+                Async::Ready(Some((Some(val), addr))) => (val, addr),
+                Async::Ready(Some((None, _))) => continue,
                 Async::NotReady => {
                     if !self.incoming.is_empty() {
                         return Ok(Async::Ready(Some(self.incoming.pop().unwrap())));
@@ -295,7 +296,7 @@ impl Stream for DPTStream {
                         Err(_) => continue,
                     };
 
-                    self.send_pong(message.addr, hash, ping_message.to)?;
+                    self.send_pong(addr, hash, ping_message.to)?;
 
                     let v = self.connected.iter().find(|v| v.id == remote_id).cloned();
                     if let Some(v) = v {
@@ -326,7 +327,7 @@ impl Stream for DPTStream {
                 },
                 0x03 /* find neighbours */ => {
                     debug!("got find neighbours message");
-                    self.send_neighbours(message.addr)?;
+                    self.send_neighbours(addr)?;
                 },
                 0x04 /* neighbours */ => {
                     debug!("got neighbours message");
@@ -363,11 +364,11 @@ impl Stream for DPTStream {
     }
 }
 
-impl Sink for DPTStream {
+impl Sink01 for DPTStream {
     type SinkItem = DPTMessage;
     type SinkError = io::Error;
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
+    fn poll_complete(&mut self) -> Poll01<(), Self::SinkError> {
         self.stream.poll_complete()
     }
 

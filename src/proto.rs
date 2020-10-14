@@ -2,6 +2,7 @@ use crate::{
     util::{keccak256, pk2id},
     PeerId,
 };
+use bytes::BytesMut;
 use k256::ecdsa::{
     recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
     signature::{DigestSigner, Signature as _},
@@ -9,14 +10,14 @@ use k256::ecdsa::{
 };
 use primitive_types::H256;
 use sha3::{Digest, Keccak256};
-use std::{io, net::SocketAddr};
-use tokio_core::net::UdpCodec;
+use std::io;
+use tokio::codec::{Decoder, Encoder};
 
 macro_rules! try_none {
     ( $ex:expr ) => {
         match $ex {
             Ok(val) => val,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(Some(None)),
         }
     };
 }
@@ -26,7 +27,6 @@ pub struct DPTCodec {
 }
 
 pub struct DPTCodecMessage {
-    pub addr: SocketAddr,
     pub typ: u8,
     pub data: Vec<u8>,
 }
@@ -37,11 +37,11 @@ impl DPTCodec {
     }
 }
 
-impl UdpCodec for DPTCodec {
-    type In = Option<(DPTCodecMessage, PeerId, H256)>;
-    type Out = DPTCodecMessage;
+impl Decoder for DPTCodec {
+    type Item = Option<(DPTCodecMessage, PeerId, H256)>;
+    type Error = io::Error;
 
-    fn decode(&mut self, src: &SocketAddr, buf: &[u8]) -> Result<Self::In, io::Error> {
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if buf.len() < 98 {
             return Ok(None);
         }
@@ -49,7 +49,7 @@ impl UdpCodec for DPTCodec {
         let hash = keccak256(&buf[32..]);
         let check_hash = H256::from_slice(&buf[0..32]);
         if check_hash != hash {
-            return Ok(None);
+            return Ok(Some(None));
         }
 
         let rec_id = try_none!(RecoveryId::new(buf[96]));
@@ -67,18 +67,15 @@ impl UdpCodec for DPTCodec {
             data.push(*item);
         }
 
-        Ok(Some((
-            DPTCodecMessage {
-                addr: *src,
-                typ,
-                data,
-            },
-            remote_id,
-            hash,
-        )))
+        Ok(Some(Some((DPTCodecMessage { typ, data }, remote_id, hash))))
     }
+}
 
-    fn encode(&mut self, mut msg: DPTCodecMessage, buf: &mut Vec<u8>) -> SocketAddr {
+impl Encoder for DPTCodec {
+    type Item = DPTCodecMessage;
+    type Error = io::Error;
+
+    fn encode(&mut self, mut msg: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
         let mut typdata = Vec::new();
         typdata.push(msg.typ);
         typdata.append(&mut msg.data);
@@ -91,8 +88,8 @@ impl UdpCodec for DPTCodec {
         hashdata.append(&mut typdata);
 
         buf.extend_from_slice(Keccak256::digest(&hashdata).as_slice());
-        buf.append(&mut hashdata);
+        buf.extend_from_slice(&hashdata);
 
-        msg.addr
+        Ok(())
     }
 }
