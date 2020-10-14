@@ -8,6 +8,7 @@ use secp256k1::{key::SecretKey, SECP256K1};
 use std::time::Duration;
 use tokio_core::reactor::Core;
 use tokio_timer::{wheel, TimeoutError};
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 const BOOTSTRAP_NODES: &[&str] = &[
@@ -26,7 +27,9 @@ const BOOTSTRAP_NODES: &[&str] = &[
 ];
 
 fn main() {
-    let _ = env_logger::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     let addr = "0.0.0.0:50505".parse().unwrap();
     let mut core = Core::new().unwrap();

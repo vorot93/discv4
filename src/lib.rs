@@ -11,7 +11,6 @@ use crate::{
 };
 use bigint::{H256, H512};
 use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
-use log::*;
 use rand::{thread_rng, Rng};
 use rlp::UntrustedRlp;
 use secp256k1::{
@@ -28,6 +27,7 @@ use tokio_core::{
     net::{UdpFramed, UdpSocket},
     reactor::{Handle, Timeout},
 };
+use tracing::*;
 use url::{Host, Url};
 
 pub type PeerId = H512;
