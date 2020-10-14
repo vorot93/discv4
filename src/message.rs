@@ -1,5 +1,5 @@
-use bigint::H256;
-use rlp::{Decodable, DecoderError, Encodable, RlpStream, UntrustedRlp};
+use primitive_types::H256;
+use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use std::net::{IpAddr, Ipv4Addr};
 
 use crate::PeerId;
@@ -26,7 +26,7 @@ impl Encodable for Neighbour {
 }
 
 impl Decodable for Neighbour {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         let address_raw: Vec<u8> = rlp.val_at(0)?;
         let address = if address_raw.len() == 4 {
             let mut raw = [0_u8; 4];
@@ -69,7 +69,7 @@ impl Encodable for Endpoint {
 }
 
 impl Decodable for Endpoint {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         let address_raw: Vec<u8> = rlp.val_at(0)?;
         let address = if address_raw.len() == 4 {
             IpAddr::V4(Ipv4Addr::new(
@@ -107,7 +107,7 @@ impl Encodable for FindNeighboursMessage {
 }
 
 impl Decodable for FindNeighboursMessage {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         Ok(Self {
             id: rlp.val_at(0)?,
             expire: rlp.val_at(1)?,
@@ -129,7 +129,7 @@ impl Encodable for NeighboursMessage {
 }
 
 impl Decodable for NeighboursMessage {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         Ok(Self {
             nodes: rlp.list_at(0)?,
             expire: rlp.val_at(1)?,
@@ -155,7 +155,7 @@ impl Encodable for PingMessage {
 }
 
 impl Decodable for PingMessage {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         Ok(Self {
             from: rlp.val_at(1)?,
             to: rlp.val_at(2)?,
@@ -181,7 +181,7 @@ impl Encodable for PongMessage {
 }
 
 impl Decodable for PongMessage {
-    fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         Ok(Self {
             to: rlp.val_at(0)?,
             echo: rlp.val_at(1)?,

@@ -9,12 +9,12 @@ use crate::{
     proto::{DPTCodec, DPTCodecMessage},
     util::pk2id,
 };
-use bigint::{H256, H512};
 use chrono::Utc;
 use futures::{Async, AsyncSink, Future, Poll, Sink, StartSend, Stream};
 use k256::ecdsa::SigningKey;
+use primitive_types::{H256, H512};
 use rand::{prelude::*, rngs::OsRng};
-use rlp::UntrustedRlp;
+use rlp::Rlp;
 use std::{
     convert::TryFrom,
     io,
@@ -290,7 +290,7 @@ impl Stream for DPTStream {
             match message.typ {
                 0x01 /* ping */ => {
                     debug!("got ping message");
-                    let ping_message: PingMessage = match UntrustedRlp::new(&message.data).as_val() {
+                    let ping_message: PingMessage = match Rlp::new(&message.data).as_val() {
                         Ok(val) => val,
                         Err(_) => continue,
                     };
@@ -306,7 +306,7 @@ impl Stream for DPTStream {
                 },
                 0x02 /* pong */ => {
                     debug!("got pong message");
-                    if UntrustedRlp::new(&message.data).as_val::<PongMessage>().is_err() {
+                    if Rlp::new(&message.data).as_val::<PongMessage>().is_err() {
                         continue
                     }
 
@@ -331,7 +331,7 @@ impl Stream for DPTStream {
                 0x04 /* neighbours */ => {
                     debug!("got neighbours message");
                     let incoming_message: NeighboursMessage =
-                        match UntrustedRlp::new(&message.data).as_val() {
+                        match Rlp::new(&message.data).as_val() {
                             Ok(val) => val,
                             Err(_) => continue,
                         };

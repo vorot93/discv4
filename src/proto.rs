@@ -2,12 +2,12 @@ use crate::{
     util::{keccak256, pk2id},
     PeerId,
 };
-use bigint::H256;
 use k256::ecdsa::{
     recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
     signature::{DigestSigner, Signature as _},
     Signature, SigningKey,
 };
+use primitive_types::H256;
 use sha3::{Digest, Keccak256};
 use std::{io, net::SocketAddr};
 use tokio_core::net::UdpCodec;
@@ -47,7 +47,7 @@ impl UdpCodec for DPTCodec {
         }
 
         let hash = keccak256(&buf[32..]);
-        let check_hash = H256::from(&buf[0..32]);
+        let check_hash = H256::from_slice(&buf[0..32]);
         if check_hash != hash {
             return Ok(None);
         }

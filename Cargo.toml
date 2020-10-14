@@ -12,11 +12,12 @@ edition = "2018"
 
 [dependencies]
 chrono = "0.4"
-etcommon-bigint = "0.2"
-etcommon-rlp = "0.2"
+fixed-hash = { version = "*", features = ["std"] }
 futures = "0.1"
 k256 = { version = "0.5", default-features = false, features = ["ecdsa"] }
+primitive-types = { version = "0.7", default-features = false, features = ["rlp"] }
 rand = "0.7"
+rlp = "0.4"
 sha3 = "0.9"
 tokio-core = "0.1"
 tokio-io = "0.1"
