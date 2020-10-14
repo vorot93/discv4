@@ -4,10 +4,7 @@ use secp256k1::{key::PublicKey, SECP256K1};
 use sha3::{Digest, Keccak256};
 
 pub fn keccak256(data: &[u8]) -> H256 {
-    let mut hasher = Keccak256::new();
-    hasher.input(data);
-    let out = hasher.result();
-    H256::from(out.as_ref())
+    H256::from(Keccak256::digest(data).as_slice())
 }
 
 pub fn pk2id(pk: &PublicKey) -> PeerId {
