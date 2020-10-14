@@ -22,7 +22,7 @@ tokio-core = "0.1"
 tokio-io = "0.1"
 tokio-timer-plus = "0.1"
 tracing = "0.1"
-url = "1.5.1"
+url = "2"
 
 [dev-dependencies]
 tracing-subscriber = "0.2"
