@@ -1,11 +1,12 @@
+use crate::PeerId;
 use arrayref::array_ref;
+use arrayvec::ArrayVec;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use rlp_derive::{RlpDecodable, RlpEncodable};
 use std::net::IpAddr;
 
-use crate::PeerId;
-
+#[derive(Clone, Copy, Debug)]
 pub struct Neighbour {
     pub address: IpAddr,
     pub udp_port: u16,
@@ -49,7 +50,7 @@ impl Decodable for Neighbour {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Endpoint {
     pub address: IpAddr,
     pub udp_port: u16,
@@ -90,15 +91,15 @@ impl Decodable for Endpoint {
     }
 }
 
-#[derive(RlpEncodable, RlpDecodable)]
+#[derive(Clone, Copy, Debug, RlpEncodable, RlpDecodable)]
 pub struct FindNeighboursMessage {
     pub id: PeerId,
     pub expire: u64,
 }
 
-#[derive(RlpEncodable, RlpDecodable)]
+#[derive(Clone, Debug, RlpEncodable, RlpDecodable)]
 pub struct NeighboursMessage {
-    pub nodes: Vec<Neighbour>,
+    pub nodes: Box<ArrayVec<[Neighbour; 16]>>,
     pub expire: u64,
 }
 

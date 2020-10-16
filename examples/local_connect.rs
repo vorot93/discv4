@@ -1,9 +1,7 @@
-use discv4::{DPTMessage, DPTNode, DPTStream};
-use futures::{compat::*, FutureExt, SinkExt, TryFutureExt, TryStreamExt};
+use discv4::{Node, NodeRecord};
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use std::time::Duration;
-use tokio::timer::Timeout;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -22,48 +20,48 @@ const BOOTSTRAP_NODES: &[&str] = &[
     "enode://5f7d0794c464b2fcd514d41e16e4b535a98ac792a71ca9667c7cef35595dc34c9a1b793c0622554cf87f34006942abb526af7d2e37d715ac32ed02170556cce2@51.161.101.207:30303",
 ];
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let addr = "0.0.0.0:50505".parse().unwrap();
 
-    let mut client = Box::pin(Compat01As03Sink::new(
-        DPTStream::new(
-            addr,
-            SigningKey::random(&mut OsRng),
-            BOOTSTRAP_NODES
-                .iter()
-                .map(|v| DPTNode::from_url(&Url::parse(v).unwrap()).unwrap())
-                .collect(),
-            "127.0.0.1".parse().unwrap(),
-            50505,
-        )
-        .unwrap(),
-    ));
+    let mut client = Node::new(
+        addr,
+        SigningKey::random(&mut OsRng),
+        BOOTSTRAP_NODES
+            .iter()
+            .map(|v| NodeRecord::from_url(&Url::parse(v).unwrap()).unwrap())
+            .collect(),
+        "127.0.0.1".parse().unwrap(),
+        50505,
+    )
+    .await
+    .unwrap();
 
     const SEC: u64 = 5;
     const DUR: u32 = 500;
 
-    tokio_compat::run_std(async move {
-        loop {
-            match Timeout::new(client.try_next().boxed().compat(), Duration::new(SEC, DUR))
-                .compat()
-                .await
-            {
-                Ok(peer) => {
-                    println!("new peer: {:?}", peer);
-                }
-                Err(err) => {
-                    if err.is_elapsed() {
-                        println!("timed out, requesting new peer ...");
-                        client.send(DPTMessage::RequestNewPeer).await.unwrap();
-                    } else {
-                        panic!(err);
-                    }
-                }
-            }
-        }
-    })
+    // tokio_compat::run_std(async move {
+    //     loop {
+    //         match Timeout::new(client.try_next().boxed().compat(), Duration::new(SEC, DUR))
+    //             .compat()
+    //             .await
+    //         {
+    //             Ok(peer) => {
+    //                 println!("new peer: {:?}", peer);
+    //             }
+    //             Err(err) => {
+    //                 if err.is_elapsed() {
+    //                     println!("timed out, requesting new peer ...");
+    //                     client.send(DPTMessage::RequestNewPeer).await.unwrap();
+    //                 } else {
+    //                     panic!(err);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // })
 }

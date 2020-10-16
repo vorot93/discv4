@@ -1,7 +1,11 @@
 use crate::PeerId;
 use k256::{ecdsa::VerifyKey, EncodedPoint};
+use plain_hasher::PlainHasher;
 use primitive_types::H256;
 use sha3::{Digest, Keccak256};
+use std::{collections::HashSet, hash::BuildHasherDefault};
+
+pub type H256Set = HashSet<H256, BuildHasherDefault<PlainHasher>>;
 
 pub fn keccak256(data: &[u8]) -> H256 {
     H256::from(Keccak256::digest(data).as_ref())

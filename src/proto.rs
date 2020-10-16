@@ -1,8 +1,4 @@
-use crate::{
-    message::*,
-    util::{keccak256, pk2id},
-    PeerId,
-};
+use crate::{message::*, util::*, PeerId};
 use anyhow::anyhow;
 use bytes::BytesMut;
 use k256::ecdsa::{
@@ -10,11 +6,12 @@ use k256::ecdsa::{
     signature::{DigestSigner, Signature as _},
     Signature, SigningKey,
 };
+use parking_lot::Mutex;
 use primitive_types::H256;
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
-use std::{io, iter::once};
-use tokio::codec::{Decoder, Encoder};
+use std::{collections::HashMap, io, iter::once, sync::Arc};
+use tokio_util::codec::{Decoder, Encoder};
 
 macro_rules! try_none {
     ( $ex:expr ) => {
@@ -25,8 +22,19 @@ macro_rules! try_none {
     };
 }
 
-pub struct DPTCodec {
+pub trait PingFilter: Send + Sync + 'static {
+    fn insert(&self, hash: H256);
+}
+
+impl PingFilter for Arc<Mutex<H256Set>> {
+    fn insert(&self, hash: H256) {
+        self.lock().insert(hash);
+    }
+}
+
+pub struct DPTCodec<F: PingFilter> {
     secret_key: SigningKey,
+    ping_filter: F,
 }
 
 pub enum DPTCodecMessage {
@@ -36,13 +44,16 @@ pub enum DPTCodecMessage {
     Neighbours(NeighboursMessage),
 }
 
-impl DPTCodec {
-    pub const fn new(secret_key: SigningKey) -> Self {
-        Self { secret_key }
+impl<F: PingFilter> DPTCodec<F> {
+    pub fn new(secret_key: SigningKey, ping_filter: F) -> Self {
+        Self {
+            secret_key,
+            ping_filter,
+        }
     }
 }
 
-impl Decoder for DPTCodec {
+impl<F: PingFilter> Decoder for DPTCodec<F> {
     type Item = anyhow::Result<(DPTCodecMessage, PeerId, H256)>;
     type Error = io::Error;
 
@@ -85,13 +96,16 @@ impl Decoder for DPTCodec {
     }
 }
 
-impl Encoder for DPTCodec {
-    type Item = DPTCodecMessage;
+impl<F: PingFilter> Encoder<DPTCodecMessage> for DPTCodec<F> {
     type Error = io::Error;
 
-    fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, msg: DPTCodecMessage, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut pinged_peer = false;
         let mut typdata = match &msg {
-            DPTCodecMessage::Ping(message) => once(1).chain(rlp::encode(message)).collect(),
+            DPTCodecMessage::Ping(message) => {
+                pinged_peer = true;
+                once(1).chain(rlp::encode(message)).collect()
+            }
             DPTCodecMessage::Pong(message) => once(2).chain(rlp::encode(message)).collect(),
             DPTCodecMessage::FindNeighbours(message) => {
                 once(3).chain(rlp::encode(message)).collect()
@@ -106,7 +120,13 @@ impl Encoder for DPTCodec {
         let mut hashdata = signature.as_bytes().to_vec();
         hashdata.append(&mut typdata);
 
-        buf.extend_from_slice(Keccak256::digest(&hashdata).as_slice());
+        let hash = Keccak256::digest(&hashdata);
+
+        if pinged_peer {
+            self.ping_filter.insert(H256::from_slice(hash.as_slice()));
+        }
+
+        buf.extend_from_slice(hash.as_slice());
         buf.extend_from_slice(&hashdata);
 
         Ok(())
