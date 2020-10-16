@@ -1,6 +1,7 @@
+use arrayref::array_ref;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use crate::PeerId;
 
@@ -14,11 +15,14 @@ pub struct Neighbour {
 impl Encodable for Neighbour {
     fn rlp_append(&self, s: &mut RlpStream) {
         s.begin_list(4);
-        let address: Vec<u8> = match self.address {
-            IpAddr::V4(v) => v.octets().as_ref().into(),
-            IpAddr::V6(v) => v.octets().as_ref().into(),
+        match self.address {
+            IpAddr::V4(v) => {
+                s.append(&v.octets().as_ref());
+            }
+            IpAddr::V6(v) => {
+                s.append(&v.octets().as_ref());
+            }
         };
-        s.append(&address);
         s.append(&self.udp_port);
         s.append(&self.tcp_port);
         s.append(&self.id);
@@ -27,17 +31,13 @@ impl Encodable for Neighbour {
 
 impl Decodable for Neighbour {
     fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
-        let address_raw: Vec<u8> = rlp.val_at(0)?;
-        let address = if address_raw.len() == 4 {
-            let mut raw = [0_u8; 4];
-            raw[..4].clone_from_slice(&address_raw[..4]);
-            IpAddr::from(raw)
-        } else if address_raw.len() == 16 {
-            let mut raw = [0_u8; 16];
-            raw[..16].clone_from_slice(&address_raw[..16]);
-            IpAddr::from(raw)
-        } else {
-            return Err(DecoderError::Custom("wrong address length"));
+        let address_raw = rlp.at(0)?.data()?;
+        let address = match address_raw.len() {
+            4 => IpAddr::from(*array_ref!(address_raw, 0, 4)),
+            16 => IpAddr::from(*array_ref!(address_raw, 0, 16)),
+            _ => {
+                return Err(DecoderError::Custom("wrong address length"));
+            }
         };
         Ok(Self {
             address,
@@ -58,11 +58,14 @@ pub struct Endpoint {
 impl Encodable for Endpoint {
     fn rlp_append(&self, s: &mut RlpStream) {
         s.begin_list(3);
-        let address: Vec<u8> = match self.address {
-            IpAddr::V4(v) => v.octets().as_ref().into(),
-            IpAddr::V6(v) => v.octets().as_ref().into(),
+        match self.address {
+            IpAddr::V4(v) => {
+                s.append(&v.octets().as_ref());
+            }
+            IpAddr::V6(v) => {
+                s.append(&v.octets().as_ref());
+            }
         };
-        s.append(&address);
         s.append(&self.udp_port);
         s.append(&self.tcp_port);
     }
@@ -70,20 +73,13 @@ impl Encodable for Endpoint {
 
 impl Decodable for Endpoint {
     fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
-        let address_raw: Vec<u8> = rlp.val_at(0)?;
-        let address = if address_raw.len() == 4 {
-            IpAddr::V4(Ipv4Addr::new(
-                address_raw[0],
-                address_raw[1],
-                address_raw[2],
-                address_raw[3],
-            ))
-        } else if address_raw.len() == 16 {
-            let mut raw = [0_u8; 16];
-            raw[..16].clone_from_slice(&address_raw[..16]);
-            IpAddr::from(raw)
-        } else {
-            return Err(DecoderError::Custom("wrong address length"));
+        let address_raw = rlp.at(0)?.data()?;
+        let address = match address_raw.len() {
+            4 => IpAddr::from(*array_ref!(address_raw, 0, 4)),
+            16 => IpAddr::from(*array_ref!(address_raw, 0, 16)),
+            _ => {
+                return Err(DecoderError::Custom("wrong address length"));
+            }
         };
         Ok(Self {
             address,
