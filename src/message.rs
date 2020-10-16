@@ -1,6 +1,7 @@
 use arrayref::array_ref;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
+use rlp_derive::{RlpDecodable, RlpEncodable};
 use std::net::IpAddr;
 
 use crate::PeerId;
@@ -89,48 +90,16 @@ impl Decodable for Endpoint {
     }
 }
 
+#[derive(RlpEncodable, RlpDecodable)]
 pub struct FindNeighboursMessage {
     pub id: PeerId,
     pub expire: u64,
 }
 
-impl Encodable for FindNeighboursMessage {
-    fn rlp_append(&self, s: &mut RlpStream) {
-        s.begin_list(2);
-        s.append(&self.id);
-        s.append(&self.expire);
-    }
-}
-
-impl Decodable for FindNeighboursMessage {
-    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
-        Ok(Self {
-            id: rlp.val_at(0)?,
-            expire: rlp.val_at(1)?,
-        })
-    }
-}
-
+#[derive(RlpEncodable, RlpDecodable)]
 pub struct NeighboursMessage {
     pub nodes: Vec<Neighbour>,
     pub expire: u64,
-}
-
-impl Encodable for NeighboursMessage {
-    fn rlp_append(&self, s: &mut RlpStream) {
-        s.begin_list(2);
-        s.append_list(&self.nodes);
-        s.append(&self.expire);
-    }
-}
-
-impl Decodable for NeighboursMessage {
-    fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
-        Ok(Self {
-            nodes: rlp.list_at(0)?,
-            expire: rlp.val_at(1)?,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]

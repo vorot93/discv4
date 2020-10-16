@@ -22,6 +22,7 @@ k256 = { version = "0.5", default-features = false, features = ["ecdsa", "std"] 
 primitive-types = { version = "0.7", default-features = false, features = ["rlp"] }
 rand = "0.7"
 rlp = "0.4"
+rlp-derive = "0.1"
 sha3 = "0.9"
 signature = { version = "1", features = ["std"] }
 tokio = "0.1"
