@@ -16,7 +16,7 @@ use futures01::{
 use k256::ecdsa::SigningKey;
 use primitive_types::{H256, H512};
 use rand::{prelude::*, rngs::OsRng};
-use rlp::Rlp;
+
 use std::{
     convert::TryFrom,
     io,
@@ -152,8 +152,7 @@ impl DPTStream {
     }
 
     fn send_ping(&mut self, addr: SocketAddr, to: DPTNode) -> Poll01<(), io::Error> {
-        let typ = 0x01_u8;
-        let message = PingMessage {
+        let message = DPTCodecMessage::Ping(PingMessage {
             from: Endpoint {
                 address: self.address,
                 udp_port: self.udp_port,
@@ -165,50 +164,41 @@ impl DPTStream {
                 tcp_port: to.tcp_port,
             },
             expire: Self::default_expire(),
-        };
-        let data = rlp::encode(&message).to_vec();
+        });
 
-        self.stream
-            .start_send((DPTCodecMessage { typ, data }, addr))?;
+        self.stream.start_send((message, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
     fn send_pong(&mut self, addr: SocketAddr, echo: H256, to: Endpoint) -> Poll01<(), io::Error> {
-        let typ = 0x02_u8;
-        let message = PongMessage {
+        let message = DPTCodecMessage::Pong(PongMessage {
             echo,
             to,
             expire: Self::default_expire(),
-        };
-        let data = rlp::encode(&message).to_vec();
+        });
 
         debug!("sending pong ...");
-        self.stream
-            .start_send((DPTCodecMessage { typ, data }, addr))?;
+        self.stream.start_send((message, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
     fn send_find_neighbours(&mut self, addr: SocketAddr) -> Poll01<(), io::Error> {
-        let typ = 0x03_u8;
-        let message = FindNeighboursMessage {
+        let message = DPTCodecMessage::FindNeighbours(FindNeighboursMessage {
             id: self.id,
             expire: Self::default_expire(),
-        };
-        let data = rlp::encode(&message).to_vec();
+        });
 
-        self.stream
-            .start_send((DPTCodecMessage { typ, data }, addr))?;
+        self.stream.start_send((message, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
     }
 
     fn send_neighbours(&mut self, addr: SocketAddr) -> Poll01<(), io::Error> {
-        let typ = 0x04_u8;
         // Return at most 3 nodes at a time.
         let mut nodes = Vec::new();
         for i in 0..self.connected.len() {
@@ -228,14 +218,12 @@ impl DPTStream {
                 id,
             });
         }
-        let message = NeighboursMessage {
+        let message = DPTCodecMessage::Neighbours(NeighboursMessage {
             nodes,
             expire: Self::default_expire(),
-        };
-        let data = rlp::encode(&message).to_vec();
+        });
 
-        self.stream
-            .start_send((DPTCodecMessage { typ, data }, addr))?;
+        self.stream.start_send((message, addr))?;
         self.stream.poll_complete()?;
 
         Ok(Async::Ready(()))
@@ -276,8 +264,11 @@ impl Stream01 for DPTStream {
 
         loop {
             let ((message, remote_id, hash), addr) = match self.stream.poll()? {
-                Async::Ready(Some((Some(val), addr))) => (val, addr),
-                Async::Ready(Some((None, _))) => continue,
+                Async::Ready(Some((Ok(val), addr))) => (val, addr),
+                Async::Ready(Some((Err(e), addr))) => {
+                    warn!("Received invalid message from {}: {}", addr, e);
+                    continue;
+                }
                 Async::NotReady => {
                     if !self.incoming.is_empty() {
                         return Ok(Async::Ready(Some(self.incoming.pop().unwrap())));
@@ -288,14 +279,8 @@ impl Stream01 for DPTStream {
                 Async::Ready(None) => return Ok(Async::Ready(None)),
             };
 
-            match message.typ {
-                0x01 /* ping */ => {
-                    debug!("got ping message");
-                    let ping_message: PingMessage = match Rlp::new(&message.data).as_val() {
-                        Ok(val) => val,
-                        Err(_) => continue,
-                    };
-
+            match message {
+                DPTCodecMessage::Ping(ping_message) => {
                     self.send_pong(addr, hash, ping_message.to)?;
 
                     let v = self.connected.iter().find(|v| v.id == remote_id).cloned();
@@ -304,17 +289,10 @@ impl Stream01 for DPTStream {
                             self.pingponged.push(v);
                         }
                     }
-                },
-                0x02 /* pong */ => {
-                    debug!("got pong message");
-                    if Rlp::new(&message.data).as_val::<PongMessage>().is_err() {
-                        continue
-                    }
-
+                }
+                DPTCodecMessage::Pong(..) => {
                     if self.timeout.is_some() {
-                        self.timeout.as_mut().unwrap().1.retain(|v| {
-                            *v != remote_id
-                        });
+                        self.timeout.as_mut().unwrap().1.retain(|v| *v != remote_id);
                     }
 
                     let v = self.connected.iter().find(|v| v.id == remote_id).cloned();
@@ -324,18 +302,13 @@ impl Stream01 for DPTStream {
                             self.pingponged.push(v);
                         }
                     }
-                },
-                0x03 /* find neighbours */ => {
+                }
+                DPTCodecMessage::FindNeighbours(..) => {
                     debug!("got find neighbours message");
                     self.send_neighbours(addr)?;
-                },
-                0x04 /* neighbours */ => {
+                }
+                DPTCodecMessage::Neighbours(incoming_message) => {
                     debug!("got neighbours message");
-                    let incoming_message: NeighboursMessage =
-                        match Rlp::new(&message.data).as_val() {
-                            Ok(val) => val,
-                            Err(_) => continue,
-                        };
                     debug!("neighbouts message len {}", incoming_message.nodes.len());
                     for node in incoming_message.nodes {
                         let node = DPTNode {
@@ -343,7 +316,7 @@ impl Stream01 for DPTStream {
                             udp_port: node.udp_port,
                             tcp_port: node.tcp_port,
                             id: node.id,
-                    };
+                        };
                         if !self.connected.contains(&node) {
                             self.send_ping(node.udp_addr(), node)?;
 
@@ -353,8 +326,7 @@ impl Stream01 for DPTStream {
                             debug!("connected {}", self.connected.len());
                         }
                     }
-                },
-                _ => { }
+                }
             }
 
             if !self.incoming.is_empty() {

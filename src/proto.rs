@@ -1,7 +1,9 @@
 use crate::{
+    message::*,
     util::{keccak256, pk2id},
     PeerId,
 };
+use anyhow::anyhow;
 use bytes::BytesMut;
 use k256::ecdsa::{
     recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
@@ -9,15 +11,16 @@ use k256::ecdsa::{
     Signature, SigningKey,
 };
 use primitive_types::H256;
+use rlp::Rlp;
 use sha3::{Digest, Keccak256};
-use std::io;
+use std::{io, iter::once};
 use tokio::codec::{Decoder, Encoder};
 
 macro_rules! try_none {
     ( $ex:expr ) => {
         match $ex {
             Ok(val) => val,
-            Err(_) => return Ok(Some(None)),
+            Err(e) => return Ok(Some(Err(anyhow::Error::new(e)))),
         }
     };
 }
@@ -26,9 +29,11 @@ pub struct DPTCodec {
     secret_key: SigningKey,
 }
 
-pub struct DPTCodecMessage {
-    pub typ: u8,
-    pub data: Vec<u8>,
+pub enum DPTCodecMessage {
+    Ping(PingMessage),
+    Pong(PongMessage),
+    FindNeighbours(FindNeighboursMessage),
+    Neighbours(NeighboursMessage),
 }
 
 impl DPTCodec {
@@ -38,7 +43,7 @@ impl DPTCodec {
 }
 
 impl Decoder for DPTCodec {
-    type Item = Option<(DPTCodecMessage, PeerId, H256)>;
+    type Item = anyhow::Result<(DPTCodecMessage, PeerId, H256)>;
     type Error = io::Error;
 
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -49,7 +54,11 @@ impl Decoder for DPTCodec {
         let hash = keccak256(&buf[32..]);
         let check_hash = H256::from_slice(&buf[0..32]);
         if check_hash != hash {
-            return Ok(Some(None));
+            return Ok(Some(Err(anyhow!(
+                "Hash check failed: computed {}, prefix {}",
+                hash,
+                check_hash
+            ))));
         }
 
         let rec_id = try_none!(RecoveryId::new(buf[96]));
@@ -64,7 +73,15 @@ impl Decoder for DPTCodec {
         let typ = buf[97];
         let data = &buf[98..];
 
-        Ok(Some(Some((DPTCodecMessage { typ, data }, remote_id, hash))))
+        let message = match typ {
+            1 => DPTCodecMessage::Ping(try_none!(Rlp::new(data).as_val())),
+            2 => DPTCodecMessage::Pong(try_none!(Rlp::new(data).as_val())),
+            3 => DPTCodecMessage::FindNeighbours(try_none!(Rlp::new(data).as_val())),
+            4 => DPTCodecMessage::Neighbours(try_none!(Rlp::new(data).as_val())),
+            other => return Ok(Some(Err(anyhow!("Invalid message type: {}", other)))),
+        };
+
+        Ok(Some(Ok((message, remote_id, hash))))
     }
 }
 
@@ -72,10 +89,15 @@ impl Encoder for DPTCodec {
     type Item = DPTCodecMessage;
     type Error = io::Error;
 
-    fn encode(&mut self, mut msg: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
-        let mut typdata = Vec::new();
-        typdata.push(msg.typ);
-        typdata.append(&mut msg.data);
+    fn encode(&mut self, msg: Self::Item, buf: &mut BytesMut) -> Result<(), Self::Error> {
+        let mut typdata = match &msg {
+            DPTCodecMessage::Ping(message) => once(1).chain(rlp::encode(message)).collect(),
+            DPTCodecMessage::Pong(message) => once(2).chain(rlp::encode(message)).collect(),
+            DPTCodecMessage::FindNeighbours(message) => {
+                once(3).chain(rlp::encode(message)).collect()
+            }
+            DPTCodecMessage::Neighbours(message) => once(4).chain(rlp::encode(message)).collect(),
+        };
 
         let signature: RecoverableSignature = self
             .secret_key

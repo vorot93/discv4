@@ -11,17 +11,19 @@ repository = "https://github.com/rust-ethereum/discv4"
 edition = "2018"
 
 [dependencies]
+anyhow = "1"
 arrayref = "0.3"
 bytes = "0.4"
 chrono = "0.4"
 fixed-hash = { version = "*", features = ["std"] }
 futures = { version = "0.3", features = ["compat"] }
 futures01 = { package = "futures", version = "0.1" }
-k256 = { version = "0.5", default-features = false, features = ["ecdsa"] }
+k256 = { version = "0.5", default-features = false, features = ["ecdsa", "std"] }
 primitive-types = { version = "0.7", default-features = false, features = ["rlp"] }
 rand = "0.7"
 rlp = "0.4"
 sha3 = "0.9"
+signature = { version = "1", features = ["std"] }
 tokio = "0.1"
 tokio-compat = "0.1"
 tracing = "0.1"
