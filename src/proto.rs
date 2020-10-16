@@ -62,10 +62,7 @@ impl Decoder for DPTCodec {
         let remote_id = pk2id(&public_key);
 
         let typ = buf[97];
-        let mut data = Vec::new();
-        for item in buf.iter().skip(98) {
-            data.push(*item);
-        }
+        let data = &buf[98..];
 
         Ok(Some(Some((DPTCodecMessage { typ, data }, remote_id, hash))))
     }
