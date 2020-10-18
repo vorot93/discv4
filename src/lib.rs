@@ -1,5 +1,6 @@
 //! Ethereum Node Discovery v4 implementation.
 
+mod kad;
 mod message;
 mod node;
 mod proto;
