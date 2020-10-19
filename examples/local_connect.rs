@@ -35,7 +35,7 @@ async fn main() {
             .iter()
             .map(|v| NodeRecord::from_url(&Url::parse(v).unwrap()).unwrap())
             .collect(),
-        "127.0.0.1".parse().unwrap(),
+        Some("127.0.0.1".parse().unwrap()),
         50505,
     )
     .await

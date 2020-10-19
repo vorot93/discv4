@@ -11,8 +11,8 @@ use std::{
 pub type H256Map<T> = HashMap<H256, T, BuildHasherDefault<PlainHasher>>;
 pub type H256Set = HashSet<H256, BuildHasherDefault<PlainHasher>>;
 
-pub fn keccak256(data: &[u8]) -> H256 {
-    H256::from(Keccak256::digest(data).as_ref())
+pub fn keccak256<T: AsRef<[u8]>>(data: T) -> H256 {
+    H256::from(Keccak256::digest(data.as_ref()).as_ref())
 }
 
 pub fn pk2id(pk: &VerifyKey) -> PeerId {

@@ -1,4 +1,4 @@
-use crate::PeerId;
+use crate::{kad, PeerId};
 use arrayref::array_ref;
 use arrayvec::ArrayVec;
 use primitive_types::H256;
@@ -91,15 +91,32 @@ impl Decodable for Endpoint {
     }
 }
 
+impl From<Neighbour> for Endpoint {
+    fn from(
+        Neighbour {
+            address,
+            tcp_port,
+            udp_port,
+            ..
+        }: Neighbour,
+    ) -> Self {
+        Self {
+            address,
+            tcp_port,
+            udp_port,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, RlpEncodable, RlpDecodable)]
-pub struct FindNeighboursMessage {
+pub struct FindNodeMessage {
     pub id: PeerId,
     pub expire: u64,
 }
 
 #[derive(Clone, Debug, RlpEncodable, RlpDecodable)]
 pub struct NeighboursMessage {
-    pub nodes: Box<ArrayVec<[Neighbour; 16]>>,
+    pub nodes: Box<ArrayVec<[Neighbour; kad::BUCKET_SIZE]>>,
     pub expire: u64,
 }
 

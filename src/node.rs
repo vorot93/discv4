@@ -1,4 +1,4 @@
-use crate::{message::*, proto::*, util::*, PeerId};
+use crate::{kad::*, message::*, proto::*, util::*, PeerId};
 use anyhow::{anyhow, bail};
 use bytes::BytesMut;
 use chrono::Utc;
@@ -9,6 +9,7 @@ use k256::ecdsa::{
     signature::{DigestSigner, Signature as _},
     Signature, SigningKey,
 };
+use num_traits::FromPrimitive;
 use parking_lot::Mutex;
 use primitive_types::H256;
 use rand::{rngs::OsRng, seq::IteratorRandom};
@@ -26,9 +27,14 @@ use std::{
 };
 use task_group::TaskGroup;
 use thiserror::Error;
-use tokio::{net::UdpSocket, stream::StreamExt, sync::mpsc::channel, time::DelayQueue};
+use tokio::{
+    net::UdpSocket,
+    stream::StreamExt,
+    sync::{mpsc::channel, oneshot::Sender as OneshotSender},
+    time::DelayQueue,
+};
 use tokio_util::{
-    codec::{Decoder, Encoder},
+    codec::{BytesCodec, Decoder, Encoder},
     udp::UdpFramed,
 };
 use tracing::*;
@@ -112,8 +118,17 @@ enum TimeoutEvent {
 
 pub struct Node {
     task_group: Arc<TaskGroup>,
-    connected: Arc<Mutex<HashMap<PeerId, Endpoint>>>,
+    connected: Arc<Mutex<Table>>,
     outstanding_pings: Arc<Mutex<H256Set>>,
+}
+
+enum PreTrigger {
+    FindNode(Option<OneshotSender<NeighboursMessage>>),
+}
+
+enum PostSendTrigger {
+    Ping,
+    FindNode,
 }
 
 impl Node {
@@ -121,11 +136,11 @@ impl Node {
         addr: SocketAddr,
         secret_key: SigningKey,
         bootstrap_nodes: Vec<NodeRecord>,
-        public_address: IpAddr,
+        public_address: Option<IpAddr>,
         tcp_port: u16,
     ) -> anyhow::Result<Self> {
         let node_endpoint = Endpoint {
-            address: public_address,
+            address: public_address.unwrap_or(addr.ip()),
             udp_port: addr.port(),
             tcp_port,
         };
@@ -133,36 +148,45 @@ impl Node {
         let task_group = Arc::new(TaskGroup::new());
         let id = pk2id(&secret_key.verify_key());
 
-        // let (mut udp_tx, mut udp_rx) = futures::stream::StreamExt::split(UdpFramed::new(
-        //     UdpSocket::bind(&addr).await?,
-        //     DPTCodec::new(secret_key, ping_filter),
-        // ));
+        let (mut udp_tx, mut udp_rx) = futures::stream::StreamExt::split(UdpFramed::new(
+            UdpSocket::bind(&addr).await?,
+            BytesCodec::new(),
+        ));
 
-        let (mut udp_rx, mut udp_tx) = UdpSocket::bind(&addr).await?.split();
+        // let (mut udp_rx, mut udp_tx) = UdpSocket::bind(&addr).await?.split();
 
         let (egress_requests_tx, mut egress_requests) = channel(1);
 
-        let connected = Arc::new(Mutex::new(HashMap::new()));
+        let connected = Arc::new(Mutex::new(Table::new(id)));
         let outstanding_pings = Arc::new(Mutex::new(H256Set::default()));
 
+        let inflight_find_node_requests = Arc::new(Mutex::new(H256Map::<
+            Option<OneshotSender<NeighboursMessage>>,
+        >::default()));
+
         task_group.spawn_with_name("discv4 egress router", {
+            let task_group = Arc::downgrade(&task_group);
+            let connected = connected.clone();
             let outstanding_pings = outstanding_pings.clone();
             async move {
-                while let Some((message, addr)) = egress_requests.next().await {
-                    let mut pinged_peer = false;
-                    let mut typdata = match &message {
-                        DPTCodecMessage::Ping(message) => {
-                            pinged_peer = true;
-                            once(1).chain(rlp::encode(message)).collect()
+                while let Some((peer, message, addr)) = egress_requests.next().await {
+                    let mut pre_trigger = None;
+                    let mut post_trigger = None;
+                    let mut typdata = match message {
+                        EgressMessage::Ping(message) => {
+                            post_trigger = Some(PostSendTrigger::Ping);
+                            once(1).chain(rlp::encode(&message)).collect()
                         }
-                        DPTCodecMessage::Pong(message) => {
-                            once(2).chain(rlp::encode(message)).collect()
+                        EgressMessage::Pong(message) => {
+                            once(2).chain(rlp::encode(&message)).collect()
                         }
-                        DPTCodecMessage::FindNeighbours(message) => {
-                            once(3).chain(rlp::encode(message)).collect()
+                        EgressMessage::FindNode((message, sender)) => {
+                            pre_trigger = Some(PreTrigger::FindNode(sender));
+                            post_trigger = Some(PostSendTrigger::FindNode);
+                            once(3).chain(rlp::encode(&message)).collect()
                         }
-                        DPTCodecMessage::Neighbours(message) => {
-                            once(4).chain(rlp::encode(message)).collect()
+                        EgressMessage::Neighbours(message) => {
+                            once(4).chain(rlp::encode(&message)).collect()
                         }
                     };
 
@@ -172,22 +196,57 @@ impl Node {
                     let mut hashdata = signature.as_bytes().to_vec();
                     hashdata.append(&mut typdata);
 
-                    let hash = Keccak256::digest(&hashdata);
+                    let hash = keccak256(&hashdata);
 
-                    if pinged_peer {
-                        outstanding_pings
-                            .lock()
-                            .insert(H256::from_slice(hash.as_slice()));
-                    }
-
-                    let mut datagram = vec![];
-                    datagram.extend_from_slice(hash.as_slice());
+                    let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
+                    datagram.extend_from_slice(hash.as_bytes());
                     datagram.extend_from_slice(&hashdata);
 
-                    if let Err(e) = udp_tx.send_to(&datagram, &addr).await {
+                    trace!(
+                        "Sending datagram to peer {}: {}",
+                        peer,
+                        hex::encode(&datagram)
+                    );
+
+                    if let Some(PreTrigger::FindNode(sender)) = pre_trigger {
+                        inflight_find_node_requests.lock().insert(hash, sender);
+                    }
+
+                    if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
                         warn!("UDP socket send failure: {}", e);
                         return;
-                    } else {
+                    } else if let Some(trigger) = post_trigger {
+                        match trigger {
+                            PostSendTrigger::Ping => {
+                                if let Some(task_group) = task_group.upgrade() {
+                                    outstanding_pings.lock().insert(hash);
+                                    task_group.spawn({
+                                        let connected = connected.clone();
+                                        let outstanding_pings = outstanding_pings.clone();
+                                        async move {
+                                            tokio::time::delay_for(PING_TIMEOUT).await;
+                                            let mut connected = connected.lock();
+                                            let mut outstanding_pings = outstanding_pings.lock();
+                                            if outstanding_pings.remove(&hash) {
+                                                connected.remove(peer);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            PostSendTrigger::FindNode => {
+                                if let Some(task_group) = task_group.upgrade() {
+                                    task_group.spawn({
+                                        let inflight_find_node_requests =
+                                            inflight_find_node_requests.clone();
+                                        async move {
+                                            tokio::time::delay_for(PING_TIMEOUT).await;
+                                            inflight_find_node_requests.lock().remove(&hash);
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -196,19 +255,18 @@ impl Node {
         let (mut seen_tx, mut seen_rx) = channel(1);
 
         task_group.spawn_with_name("discv4 ingress router", {
-            let egress_requests_tx = egress_requests_tx.clone();
+            let mut egress_requests_tx = egress_requests_tx.clone();
+            let connected = connected.clone();
+            let outstanding_pings = outstanding_pings.clone();
             async move {
-                loop {
-                    let mut buf = [0_u8; MAX_PACKET_SIZE];
-                    match udp_rx.recv_from(&mut buf).await {
+                while let Some(res) = udp_rx.next().await {
+                    match res {
                         Err(e) => {
                             warn!("UDP socket recv failure: {}", e);
                             break;
                         }
-                        Ok((size, addr)) => {
+                        Ok((buf, addr)) => {
                             if let Err(e) = async {
-                                let buf = &buf[..MAX_PACKET_SIZE];
-
                                 let min_len = 32 + 65 + 1;
 
                                 if buf.len() < min_len {
@@ -238,31 +296,70 @@ impl Node {
                                 let typ = buf[97];
                                 let data = &buf[98..];
 
-                                let message = match typ {
-                                    1 => DPTCodecMessage::Ping(Rlp::new(data).as_val()?),
-                                    2 => DPTCodecMessage::Pong(Rlp::new(data).as_val()?),
-                                    3 => DPTCodecMessage::FindNeighbours(Rlp::new(data).as_val()?),
-                                    4 => DPTCodecMessage::Neighbours(Rlp::new(data).as_val()?),
-                                    other => bail!("Invalid message type: {}", other),
+                                match MessageId::from_u8(typ) {
+                                    Some(MessageId::Ping) => {
+                                        let ping_data = Rlp::new(data).as_val::<PingMessage>()?;
+
+                                        connected.lock().push(Neighbour {
+                                            address: ping_data.from.address,
+                                            udp_port: ping_data.from.udp_port,
+                                            tcp_port: ping_data.from.udp_port,
+                                            id: remote_id,
+                                        });
+
+                                        egress_requests_tx
+                                            .send((
+                                                remote_id,
+                                                EgressMessage::Pong(PongMessage {
+                                                    to: ping_data.from,
+                                                    echo: hash,
+                                                    expire: ping_data.expire,
+                                                }),
+                                                SocketAddr::new(
+                                                    ping_data.to.address,
+                                                    ping_data.to.udp_port,
+                                                ),
+                                            ))
+                                            .await;
+                                    }
+                                    Some(MessageId::Pong) => {
+                                        outstanding_pings.lock().remove(&hash);
+                                    }
+                                    Some(MessageId::FindNode) => {
+                                        let message = Rlp::new(data).as_val::<FindNodeMessage>()?;
+
+                                        let mut neighbours = None;
+                                        {
+                                            let connected = connected.lock();
+
+                                            // Only send to nodes that have been proofed.
+                                            if connected.get(remote_id).is_some() {
+                                                neighbours =
+                                                    connected.neighbours(remote_id).map(Box::new);
+                                            }
+                                        }
+
+                                        if let Some(nodes) = neighbours {
+                                            egress_requests_tx
+                                                .send((
+                                                    remote_id,
+                                                    EgressMessage::Neighbours(NeighboursMessage {
+                                                        nodes,
+                                                        expire: message.expire,
+                                                    }),
+                                                    addr,
+                                                ))
+                                                .await;
+                                        }
+                                    }
+                                    Some(MessageId::Neighbours) => {
+                                        let message =
+                                            Rlp::new(data).as_val::<NeighboursMessage>()?;
+                                    }
+                                    other => bail!("Invalid message type: {}", typ),
                                 };
 
                                 Ok(())
-
-                                // match message {
-                                //     Err(e) => {
-                                //         warn!("Received invalid message: {}", e);
-                                //     }
-                                //     Ok((message, peer_id, hash)) => {
-                                //         seen_tx.send(peer_id).await;
-                                //         match message {
-                                //             DPTCodecMessage::Ping(message) => {
-                                //                 // handle ping
-                                //             }
-                                //             DPTCodecMessage::Pong(message) => {}
-                                //             _ => todo!(),
-                                //         }
-                                //     }
-                                // }
                             }
                             .await
                             {
@@ -289,10 +386,10 @@ impl Node {
 
                             match event {
                                 TimeoutEvent::Stale => {
-                                    let to = connected.lock().get(&node).copied();
+                                    let to = connected.lock().get(node);
                                     if let Some(to) = to {
-                                        let _ = egress_requests_tx.send((DPTCodecMessage::Ping(PingMessage {
-                                            from: todo!(),
+                                        let _ = egress_requests_tx.send((node, EgressMessage::Ping(PingMessage {
+                                            from: node_endpoint,
                                             to,
                                             expire: u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception") + PING_TIMEOUT.as_secs()
                                         }), SocketAddr::from((to.address, to.udp_port)))).await;
@@ -301,7 +398,7 @@ impl Node {
                                     }
                                 }
                                 TimeoutEvent::PingExpired => {
-                                    connected.lock().remove(&node);
+                                    connected.lock().remove(node);
                                 }
                             }
                         }
@@ -336,28 +433,5 @@ impl Node {
             // udp_port: addr.port(),
             // tcp_port,
         })
-    }
-
-    pub fn random(&self) -> Option<NodeRecord> {
-        self.connected
-            .lock()
-            .iter()
-            .map(|(&peer, &endpoint)| (peer, endpoint))
-            .choose(&mut OsRng)
-            .map(
-                |(
-                    id,
-                    Endpoint {
-                        address,
-                        udp_port,
-                        tcp_port,
-                    },
-                )| NodeRecord {
-                    id,
-                    address,
-                    udp_port,
-                    tcp_port,
-                },
-            )
     }
 }
