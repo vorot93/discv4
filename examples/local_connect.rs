@@ -1,7 +1,6 @@
 use discv4::{Node, NodeRecord};
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
-use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -28,7 +27,7 @@ async fn main() {
 
     let addr = "0.0.0.0:50505".parse().unwrap();
 
-    let mut client = Node::new(
+    let _client = Node::new(
         addr,
         SigningKey::random(&mut OsRng),
         BOOTSTRAP_NODES
@@ -40,9 +39,6 @@ async fn main() {
     )
     .await
     .unwrap();
-
-    const SEC: u64 = 5;
-    const DUR: u32 = 500;
 
     // tokio_compat::run_std(async move {
     //     loop {

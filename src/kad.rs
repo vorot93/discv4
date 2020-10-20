@@ -1,19 +1,36 @@
 use crate::{message::*, util::*, PeerId};
 use array_init::array_init;
 use arrayvec::ArrayVec;
-use parking_lot::Mutex;
 use primitive_types::H256;
-use sha3::{Digest, Keccak256};
-use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
-    sync::Arc,
-    time::Instant,
-};
+use std::collections::VecDeque;
 
 pub const BUCKET_SIZE: usize = 16;
+pub const REPLACEMENTS_SIZE: usize = 16;
 pub const ADDRESS_BYTES_SIZE: usize = 256;
 
-pub type KBucket = VecDeque<Neighbour>;
+#[derive(Default)]
+pub struct KBucket {
+    bucket: VecDeque<Neighbour>,
+    replacements: VecDeque<Neighbour>,
+}
+
+impl KBucket {
+    pub fn find_peer_pos(&self, peer: PeerId) -> Option<usize> {
+        for i in 0..self.bucket.len() {
+            if self.bucket[i].id == peer {
+                return Some(i);
+            }
+        }
+
+        None
+    }
+
+    pub fn push_replacement(&mut self, peer: Neighbour) {
+        if self.replacements.len() < REPLACEMENTS_SIZE {
+            self.replacements.push_back(peer)
+        }
+    }
+}
 
 pub struct Table {
     id_hash: H256,
@@ -59,7 +76,7 @@ impl Table {
 
     pub fn get(&self, peer: PeerId) -> Option<Endpoint> {
         if let Some(bucket) = self.bucket(peer) {
-            for entry in bucket {
+            for entry in &bucket.bucket {
                 if entry.id == peer {
                     return Some((*entry).into());
                 }
@@ -69,30 +86,51 @@ impl Table {
         None
     }
 
-    pub fn push(&mut self, peer: Neighbour) -> bool {
+    /// Add verified peer if there is space.
+    pub fn add_verified(&mut self, peer: Neighbour) {
         if let Some(bucket) = self.bucket_mut(peer.id) {
-            if bucket.len() >= BUCKET_SIZE {
-                return false;
+            if let Some(pos) = bucket.find_peer_pos(peer.id) {
+                bucket.bucket.remove(pos);
             }
 
-            for entry in &*bucket {
-                if entry.id == peer.id {
-                    return false;
-                }
+            // Push to front of bucket if we have less than BUCKET_SIZE peers, or we are shuffling existing peer...
+            if bucket.bucket.len() < BUCKET_SIZE {
+                bucket.bucket.push_front(peer);
+            } else {
+                // ...add to replacements otherwise
+                bucket.push_replacement(peer);
             }
-
-            bucket.push_front(peer);
-            return true;
         }
-
-        false
     }
 
+    /// Add seen peer if there is space.
+    pub fn add_seen(&mut self, peer: Neighbour) {
+        if let Some(bucket) = self.bucket_mut(peer.id) {
+            if bucket.find_peer_pos(peer.id).is_some() {
+                // Peer exists already, do nothing
+                return;
+            }
+
+            // Push to back of bucket if we have less than BUCKET_SIZE peers...
+            if bucket.bucket.len() < BUCKET_SIZE {
+                bucket.bucket.push_back(peer);
+            } else {
+                // ...add to replacements otherwise
+                bucket.push_replacement(peer);
+            }
+        }
+    }
+
+    /// Remove node from the bucket
     pub fn remove(&mut self, peer: PeerId) -> bool {
         if let Some(bucket) = self.bucket_mut(peer) {
-            for i in 0..bucket.len() {
-                if bucket[i].id == peer {
-                    bucket.remove(i);
+            for i in 0..bucket.bucket.len() {
+                if bucket.bucket[i].id == peer {
+                    bucket.bucket.remove(i);
+                    if let Some(node) = bucket.replacements.pop_front() {
+                        bucket.bucket.push_back(node);
+                    }
+
                     return true;
                 }
             }
@@ -104,6 +142,7 @@ impl Table {
     pub fn neighbours(&self, peer: PeerId) -> Option<ArrayVec<[Neighbour; BUCKET_SIZE]>> {
         self.bucket(peer).map(|bucket| {
             bucket
+                .bucket
                 .iter()
                 .filter_map(|neighbour| {
                     if peer == neighbour.id {
@@ -119,7 +158,8 @@ impl Table {
     pub fn nearest_node_entries(&self, target: PeerId) -> Vec<Neighbour> {
         let mut out = self
             .kbuckets
-            .into_iter()
+            .iter()
+            .map(|bucket| &bucket.bucket)
             .flatten()
             .copied()
             .collect::<Vec<_>>();

@@ -1,6 +1,5 @@
 use crate::{kad::*, message::*, proto::*, util::*, PeerId};
 use anyhow::{anyhow, bail};
-use bytes::BytesMut;
 use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
 use futures::SinkExt;
@@ -12,13 +11,11 @@ use k256::ecdsa::{
 use num_traits::FromPrimitive;
 use parking_lot::Mutex;
 use primitive_types::H256;
-use rand::{rngs::OsRng, seq::IteratorRandom};
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
 use std::{
     collections::HashMap,
     convert::TryFrom,
-    io,
     iter::once,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
@@ -33,10 +30,7 @@ use tokio::{
     sync::{mpsc::channel, oneshot::Sender as OneshotSender},
     time::DelayQueue,
 };
-use tokio_util::{
-    codec::{BytesCodec, Decoder, Encoder},
-    udp::UdpFramed,
-};
+use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 use tracing::*;
 use url::{Host, Url};
 
@@ -160,7 +154,8 @@ impl Node {
         let connected = Arc::new(Mutex::new(Table::new(id)));
         let outstanding_pings = Arc::new(Mutex::new(H256Set::default()));
 
-        let inflight_find_node_requests = Arc::new(Mutex::new(H256Map::<
+        let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
+            PeerId,
             Option<OneshotSender<NeighboursMessage>>,
         >::default()));
 
@@ -168,6 +163,7 @@ impl Node {
             let task_group = Arc::downgrade(&task_group);
             let connected = connected.clone();
             let outstanding_pings = outstanding_pings.clone();
+            let inflight_find_node_requests = inflight_find_node_requests.clone();
             async move {
                 while let Some((peer, message, addr)) = egress_requests.next().await {
                     let mut pre_trigger = None;
@@ -209,7 +205,7 @@ impl Node {
                     );
 
                     if let Some(PreTrigger::FindNode(sender)) = pre_trigger {
-                        inflight_find_node_requests.lock().insert(hash, sender);
+                        inflight_find_node_requests.lock().insert(peer, sender);
                     }
 
                     if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
@@ -241,7 +237,7 @@ impl Node {
                                             inflight_find_node_requests.clone();
                                         async move {
                                             tokio::time::delay_for(PING_TIMEOUT).await;
-                                            inflight_find_node_requests.lock().remove(&hash);
+                                            inflight_find_node_requests.lock().remove(&peer);
                                         }
                                     });
                                 }
@@ -296,18 +292,20 @@ impl Node {
                                 let typ = buf[97];
                                 let data = &buf[98..];
 
+                                let _ = seen_tx.send(remote_id).await;
+
                                 match MessageId::from_u8(typ) {
                                     Some(MessageId::Ping) => {
                                         let ping_data = Rlp::new(data).as_val::<PingMessage>()?;
 
-                                        connected.lock().push(Neighbour {
+                                        connected.lock().add_verified(Neighbour {
                                             address: ping_data.from.address,
                                             udp_port: ping_data.from.udp_port,
                                             tcp_port: ping_data.from.udp_port,
                                             id: remote_id,
                                         });
 
-                                        egress_requests_tx
+                                        let _ = egress_requests_tx
                                             .send((
                                                 remote_id,
                                                 EgressMessage::Pong(PongMessage {
@@ -340,7 +338,7 @@ impl Node {
                                         }
 
                                         if let Some(nodes) = neighbours {
-                                            egress_requests_tx
+                                            let _ = egress_requests_tx
                                                 .send((
                                                     remote_id,
                                                     EgressMessage::Neighbours(NeighboursMessage {
@@ -353,10 +351,26 @@ impl Node {
                                         }
                                     }
                                     Some(MessageId::Neighbours) => {
-                                        let message =
-                                            Rlp::new(data).as_val::<NeighboursMessage>()?;
+                                        // Did we actually ask for neighbours? Ignore message if not.
+                                        if let Some(cb) =
+                                            inflight_find_node_requests.lock().remove(&remote_id)
+                                        {
+                                            // OK, so we did ask, let's handle the message.
+                                            let message =
+                                                Rlp::new(data).as_val::<NeighboursMessage>()?;
+
+                                            let mut connected = connected.lock();
+
+                                            for peer in message.nodes.iter() {
+                                                connected.add_seen(*peer);
+                                            }
+
+                                            if let Some(cb) = cb {
+                                                let _ = cb.send(message);
+                                            }
+                                        }
                                     }
-                                    other => bail!("Invalid message type: {}", typ),
+                                    None => bail!("Invalid message type: {}", typ),
                                 };
 
                                 Ok(())
@@ -422,16 +436,6 @@ impl Node {
             task_group,
             connected,
             outstanding_pings,
-            // stream: ,
-            // id,
-            // connected: bootstrap_nodes.clone(),
-            // incoming: bootstrap_nodes,
-            // pingponged: Vec::new(),
-            // bootstrapped: false,
-            // timeout: None,
-            // address: public_address,
-            // udp_port: addr.port(),
-            // tcp_port,
         })
     }
 }
