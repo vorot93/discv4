@@ -479,6 +479,7 @@ impl Node {
 
         let egress_requests_tx = self.egress_requests_tx.clone();
 
+        // Get all nodes from local table sorted by distance
         let mut nearest_nodes = self
             .connected
             .lock()
@@ -498,33 +499,43 @@ impl Node {
         loop {
             trace!("Lookup round #{}", lookup_round);
             let mut found_nodes = false;
-            let fut = nearest_nodes.iter_mut().take(ALPHA).map(|(_, node)| {
-                node.queried = true;
-                let mut egress_requests_tx = egress_requests_tx.clone();
-                timeout(PING_TIMEOUT, async move {
-                    let (tx, rx) = oneshot();
-                    let _ = egress_requests_tx
-                        .send((
-                            SocketAddr::new(node.node.address, node.node.udp_port),
-                            node.node.id,
-                            EgressMessage::FindNode((
-                                FindNodeMessage {
-                                    id: target,
-                                    expire: find_node_expiry(),
-                                },
-                                Some(tx),
-                            )),
-                        ))
-                        .await;
-                    rx.await.ok()
-                })
-            });
+            // For each node of ALPHA closest and not queried yet...
+            let fut = nearest_nodes
+                .iter_mut()
+                .take(ALPHA)
+                .filter(|(_, node)| !node.queried)
+                .map(|(_, node)| {
+                    // ...send find node request...
+                    node.queried = true;
+                    let mut egress_requests_tx = egress_requests_tx.clone();
+                    timeout(PING_TIMEOUT, async move {
+                        let (tx, rx) = oneshot();
+                        let _ = egress_requests_tx
+                            .send((
+                                SocketAddr::new(node.node.address, node.node.udp_port),
+                                node.node.id,
+                                EgressMessage::FindNode((
+                                    FindNodeMessage {
+                                        id: target,
+                                        expire: find_node_expiry(),
+                                    },
+                                    Some(tx),
+                                )),
+                            ))
+                            .await;
+                        // ...and await for Neighbours response
+                        rx.await.ok()
+                    })
+                });
             for message in join_all(fut).await {
                 if let Ok(Some(message)) = message {
+                    // If we have a node...
                     for node in message.nodes.into_iter() {
+                        // ...and it's not been seen yet...
                         if let Entry::Vacant(vacant) =
                             nearest_nodes.entry(distance(target, node.id))
                         {
+                            // ...add to the set and continue the query
                             found_nodes = true;
                             vacant.insert(QueryNode {
                                 node,
@@ -535,7 +546,7 @@ impl Node {
                 }
             }
 
-            // Round did not yield any closer nodes.
+            // if this round did not yield any new nodes, terminate
             if !found_nodes {
                 break;
             }
