@@ -15,7 +15,7 @@ pub fn distance(n1: NodeId, n2: NodeId) -> H256 {
 
 pub type NodeBucket = ArrayVec<[NodeRecord; BUCKET_SIZE]>;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct KBucket {
     bucket: VecDeque<NodeRecord>,
     replacements: VecDeque<NodeRecord>,
@@ -39,6 +39,7 @@ impl KBucket {
     }
 }
 
+#[derive(Debug)]
 pub struct Table {
     id_hash: H256,
     kbuckets: [KBucket; ADDRESS_BYTES_SIZE],
@@ -94,7 +95,9 @@ impl Table {
     }
 
     /// Add verified peer if there is space.
+    #[instrument]
     pub fn add_verified(&mut self, peer: NodeRecord) {
+        trace!("Adding peer");
         if let Some(bucket) = self.bucket_mut(peer.id) {
             if let Some(pos) = bucket.find_peer_pos(peer.id) {
                 bucket.bucket.remove(pos);
@@ -111,7 +114,9 @@ impl Table {
     }
 
     /// Add seen peer if there is space.
+    #[instrument]
     pub fn add_seen(&mut self, peer: NodeRecord) {
+        trace!("Adding peer");
         if let Some(bucket) = self.bucket_mut(peer.id) {
             if bucket.find_peer_pos(peer.id).is_some() {
                 // Peer exists already, do nothing
