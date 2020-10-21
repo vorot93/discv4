@@ -114,22 +114,13 @@ impl NodeRecord {
     }
 }
 
-enum TimeoutRequest {
-    /// Node is stale, need a ping
-    Stale,
-    /// Node is alive, reset timeout
-    Communication,
-}
-
 enum TimeoutEvent {
     Stale,
-    PingExpired,
 }
 
 pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
-    outstanding_pings: Arc<Mutex<H256Set>>,
 
     egress_requests_tx: Sender<(SocketAddr, PeerId, EgressMessage)>,
 }
@@ -152,7 +143,7 @@ impl Node {
         tcp_port: u16,
     ) -> anyhow::Result<Arc<Self>> {
         let node_endpoint = Endpoint {
-            address: public_address.unwrap_or(addr.ip()),
+            address: public_address.unwrap_or_else(|| addr.ip()),
             udp_port: addr.port(),
             tcp_port,
         };
@@ -269,7 +260,6 @@ impl Node {
         task_group.spawn_with_name("discv4 ingress router", {
             let mut egress_requests_tx = egress_requests_tx.clone();
             let connected = connected.clone();
-            let outstanding_pings = outstanding_pings.clone();
             async move {
                 while let Some(res) = udp_rx.next().await {
                     match res {
@@ -278,6 +268,7 @@ impl Node {
                             break;
                         }
                         Ok((buf, addr)) => {
+                            trace!("Received message from {}: {}", addr, hex::encode(&buf));
                             if let Err(e) = async {
                                 let min_len = 32 + 65 + 1;
 
@@ -314,7 +305,7 @@ impl Node {
                                     Some(MessageId::Ping) => {
                                         let ping_data = Rlp::new(data).as_val::<PingMessage>()?;
 
-                                        connected.lock().add_verified(Neighbour {
+                                        connected.lock().add_verified(NodeRecord {
                                             address: ping_data.from.address,
                                             udp_port: ping_data.from.udp_port,
                                             tcp_port: ping_data.from.udp_port,
@@ -427,9 +418,6 @@ impl Node {
                                         mapping.insert(node, pending_timeouts.insert((TimeoutEvent::Stale, node), PING_TIMEOUT));
                                     }
                                 }
-                                TimeoutEvent::PingExpired => {
-                                    connected.lock().remove(node);
-                                }
                             }
                         }
                         Some(node) = seen_rx.next() => {
@@ -451,7 +439,6 @@ impl Node {
         let this = Arc::new(Self {
             task_group,
             connected,
-            outstanding_pings,
             egress_requests_tx,
         });
 
@@ -471,9 +458,9 @@ impl Node {
     }
 
     #[instrument(skip(self))]
-    pub async fn lookup(&self, target: PeerId) -> Vec<Neighbour> {
+    pub async fn lookup(&self, target: PeerId) -> Vec<NodeRecord> {
         struct QueryNode {
-            node: Neighbour,
+            node: NodeRecord,
             queried: bool,
         }
 

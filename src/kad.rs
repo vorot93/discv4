@@ -1,4 +1,4 @@
-use crate::{message::*, util::*, PeerId};
+use crate::{message::*, util::*, NodeRecord, PeerId};
 use array_init::array_init;
 use arrayvec::ArrayVec;
 use primitive_types::H256;
@@ -12,10 +12,12 @@ pub fn distance(n1: PeerId, n2: PeerId) -> H256 {
     keccak256(n1) ^ keccak256(n2)
 }
 
+pub type NodeBucket = ArrayVec<[NodeRecord; BUCKET_SIZE]>;
+
 #[derive(Default)]
 pub struct KBucket {
-    bucket: VecDeque<Neighbour>,
-    replacements: VecDeque<Neighbour>,
+    bucket: VecDeque<NodeRecord>,
+    replacements: VecDeque<NodeRecord>,
 }
 
 impl KBucket {
@@ -29,7 +31,7 @@ impl KBucket {
         None
     }
 
-    pub fn push_replacement(&mut self, peer: Neighbour) {
+    pub fn push_replacement(&mut self, peer: NodeRecord) {
         if self.replacements.len() < REPLACEMENTS_SIZE {
             self.replacements.push_back(peer)
         }
@@ -91,7 +93,7 @@ impl Table {
     }
 
     /// Add verified peer if there is space.
-    pub fn add_verified(&mut self, peer: Neighbour) {
+    pub fn add_verified(&mut self, peer: NodeRecord) {
         if let Some(bucket) = self.bucket_mut(peer.id) {
             if let Some(pos) = bucket.find_peer_pos(peer.id) {
                 bucket.bucket.remove(pos);
@@ -108,7 +110,7 @@ impl Table {
     }
 
     /// Add seen peer if there is space.
-    pub fn add_seen(&mut self, peer: Neighbour) {
+    pub fn add_seen(&mut self, peer: NodeRecord) {
         if let Some(bucket) = self.bucket_mut(peer.id) {
             if bucket.find_peer_pos(peer.id).is_some() {
                 // Peer exists already, do nothing
@@ -143,7 +145,7 @@ impl Table {
         false
     }
 
-    pub fn neighbours(&self, peer: PeerId) -> Option<ArrayVec<[Neighbour; BUCKET_SIZE]>> {
+    pub fn neighbours(&self, peer: PeerId) -> Option<NodeBucket> {
         self.bucket(peer).map(|bucket| {
             bucket
                 .bucket
@@ -159,7 +161,7 @@ impl Table {
         })
     }
 
-    pub fn nearest_node_entries(&self, target: PeerId) -> BTreeMap<H256, Neighbour> {
+    pub fn nearest_node_entries(&self, target: PeerId) -> BTreeMap<H256, NodeRecord> {
         self.kbuckets
             .iter()
             .map(|bucket| &bucket.bucket)

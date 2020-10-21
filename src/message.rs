@@ -1,20 +1,11 @@
-use crate::{kad, PeerId};
+use crate::{kad::NodeBucket, NodeRecord, PeerId};
 use arrayref::array_ref;
-use arrayvec::ArrayVec;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
 use rlp_derive::{RlpDecodable, RlpEncodable};
 use std::net::IpAddr;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Neighbour {
-    pub address: IpAddr,
-    pub udp_port: u16,
-    pub tcp_port: u16,
-    pub id: PeerId,
-}
-
-impl Encodable for Neighbour {
+impl Encodable for NodeRecord {
     fn rlp_append(&self, s: &mut RlpStream) {
         s.begin_list(4);
         match self.address {
@@ -31,7 +22,7 @@ impl Encodable for Neighbour {
     }
 }
 
-impl Decodable for Neighbour {
+impl Decodable for NodeRecord {
     fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
         let address_raw = rlp.at(0)?.data()?;
         let address = match address_raw.len() {
@@ -91,14 +82,14 @@ impl Decodable for Endpoint {
     }
 }
 
-impl From<Neighbour> for Endpoint {
+impl From<NodeRecord> for Endpoint {
     fn from(
-        Neighbour {
+        NodeRecord {
             address,
             tcp_port,
             udp_port,
             ..
-        }: Neighbour,
+        }: NodeRecord,
     ) -> Self {
         Self {
             address,
@@ -116,7 +107,7 @@ pub struct FindNodeMessage {
 
 #[derive(Clone, Debug, RlpEncodable, RlpDecodable)]
 pub struct NeighboursMessage {
-    pub nodes: Box<ArrayVec<[Neighbour; kad::BUCKET_SIZE]>>,
+    pub nodes: Box<NodeBucket>,
     pub expire: u64,
 }
 
