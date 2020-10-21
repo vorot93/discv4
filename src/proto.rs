@@ -11,8 +11,8 @@ pub enum MessageId {
 }
 
 pub enum EgressMessage {
-    Ping(PingMessage),
+    Ping(PingMessage, Option<OneshotSender<()>>),
     Pong(PongMessage),
-    FindNode((FindNodeMessage, Option<OneshotSender<NeighboursMessage>>)),
+    FindNode(FindNodeMessage, Option<OneshotSender<NeighboursMessage>>),
     Neighbours(NeighboursMessage),
 }

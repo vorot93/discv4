@@ -48,6 +48,10 @@ fn expiry(timeout: Duration) -> u64 {
         + timeout.as_secs()
 }
 
+fn ping_expiry() -> u64 {
+    expiry(PING_TIMEOUT)
+}
+
 fn find_node_expiry() -> u64 {
     expiry(FIND_NODE_TIMEOUT)
 }
@@ -122,10 +126,13 @@ pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
 
+    node_endpoint: Endpoint,
+
     egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
 }
 
 enum PreTrigger {
+    Ping(Option<OneshotSender<()>>),
     FindNode(Option<OneshotSender<NeighboursMessage>>),
 }
 
@@ -151,6 +158,8 @@ impl Node {
         let task_group = Arc::new(TaskGroup::new());
         let id = pk2id(&secret_key.verify_key());
 
+        debug!("Starting node with id: {}", id);
+
         let (mut udp_tx, mut udp_rx) = futures::stream::StreamExt::split(UdpFramed::new(
             UdpSocket::bind(&addr).await?,
             BytesCodec::new(),
@@ -160,35 +169,37 @@ impl Node {
 
         let mut table = Table::new(id);
         for node in bootstrap_nodes {
+            debug!("Adding bootstrap node: {:?}", node);
             table.add_verified(node);
         }
 
         let connected = Arc::new(Mutex::new(table));
-        let outstanding_pings = Arc::new(Mutex::new(H256Set::default()));
 
         let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
             NodeId,
             Option<OneshotSender<NeighboursMessage>>,
         >::default()));
+        let inflight_ping_requests = Arc::new(Mutex::new(H256Map::default()));
 
         task_group.spawn_with_name("discv4 egress router", {
             let task_group = Arc::downgrade(&task_group);
             let connected = connected.clone();
-            let outstanding_pings = outstanding_pings.clone();
             let inflight_find_node_requests = inflight_find_node_requests.clone();
+            let inflight_ping_requests = inflight_ping_requests.clone();
             async move {
                 while let Some((addr, peer, message)) = egress_requests.next().await {
                     let mut pre_trigger = None;
                     let mut post_trigger = None;
                     let mut typdata = match message {
-                        EgressMessage::Ping(message) => {
+                        EgressMessage::Ping(message, sender) => {
+                            pre_trigger = Some(PreTrigger::Ping(sender));
                             post_trigger = Some(PostSendTrigger::Ping);
                             once(1).chain(rlp::encode(&message)).collect()
                         }
                         EgressMessage::Pong(message) => {
                             once(2).chain(rlp::encode(&message)).collect()
                         }
-                        EgressMessage::FindNode((message, sender)) => {
+                        EgressMessage::FindNode(message, sender) => {
                             pre_trigger = Some(PreTrigger::FindNode(sender));
                             post_trigger = Some(PostSendTrigger::FindNode);
                             once(3).chain(rlp::encode(&message)).collect()
@@ -216,8 +227,14 @@ impl Node {
                         hex::encode(&datagram)
                     );
 
-                    if let Some(PreTrigger::FindNode(sender)) = pre_trigger {
-                        inflight_find_node_requests.lock().insert(peer, sender);
+                    match pre_trigger {
+                        Some(PreTrigger::FindNode(sender)) => {
+                            inflight_find_node_requests.lock().insert(peer, sender);
+                        }
+                        Some(PreTrigger::Ping(sender)) => {
+                            inflight_ping_requests.lock().insert(hash, sender);
+                        }
+                        None => {}
                     }
 
                     if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
@@ -227,15 +244,15 @@ impl Node {
                         match trigger {
                             PostSendTrigger::Ping => {
                                 if let Some(task_group) = task_group.upgrade() {
-                                    outstanding_pings.lock().insert(hash);
                                     task_group.spawn({
                                         let connected = connected.clone();
-                                        let outstanding_pings = outstanding_pings.clone();
+                                        let inflight_ping_requests = inflight_ping_requests.clone();
                                         async move {
                                             delay_for(PING_TIMEOUT).await;
                                             let mut connected = connected.lock();
-                                            let mut outstanding_pings = outstanding_pings.lock();
-                                            if outstanding_pings.remove(&hash) {
+                                            let mut inflight_ping_requests =
+                                                inflight_ping_requests.lock();
+                                            if inflight_ping_requests.remove(&hash).is_some() {
                                                 connected.remove(peer);
                                             }
                                         }
@@ -244,11 +261,12 @@ impl Node {
                             }
                             PostSendTrigger::FindNode => {
                                 if let Some(task_group) = task_group.upgrade() {
+                                    // TODO: move to timeout tracker
                                     task_group.spawn({
                                         let inflight_find_node_requests =
                                             inflight_find_node_requests.clone();
                                         async move {
-                                            delay_for(PING_TIMEOUT).await;
+                                            delay_for(FIND_NODE_TIMEOUT).await;
                                             inflight_find_node_requests.lock().remove(&peer);
                                         }
                                     });
@@ -333,7 +351,16 @@ impl Node {
                                             .await;
                                     }
                                     Some(MessageId::Pong) => {
-                                        outstanding_pings.lock().remove(&hash);
+                                        let message = Rlp::new(data).as_val::<PongMessage>()?;
+
+                                        // Did we actually ask for this? Ignore message if not.
+                                        if let Some(cb) =
+                                            inflight_ping_requests.lock().remove(&message.echo)
+                                        {
+                                            if let Some(cb) = cb {
+                                                let _ = cb.send(());
+                                            }
+                                        }
                                     }
                                     Some(MessageId::FindNode) => {
                                         let message = Rlp::new(data).as_val::<FindNodeMessage>()?;
@@ -363,7 +390,7 @@ impl Node {
                                         }
                                     }
                                     Some(MessageId::Neighbours) => {
-                                        // Did we actually ask for neighbours? Ignore message if not.
+                                        // Did we actually ask for this? Ignore message if not.
                                         if let Some(cb) =
                                             inflight_find_node_requests.lock().remove(&remote_id)
                                         {
@@ -418,7 +445,7 @@ impl Node {
                                             from: node_endpoint,
                                             to,
                                             expire: u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception") + PING_TIMEOUT.as_secs()
-                                        }))).await;
+                                        }, None))).await;
 
                                         mapping.insert(node, pending_timeouts.insert((TimeoutEvent::Stale, node), PING_TIMEOUT));
                                     }
@@ -444,6 +471,7 @@ impl Node {
         let this = Arc::new(Self {
             task_group,
             connected,
+            node_endpoint,
             egress_requests_tx,
         });
 
@@ -459,16 +487,56 @@ impl Node {
             }
         });
 
+        for bucket_no in 0..ADDRESS_BITS {
+            this.task_group.spawn_with_name(
+                format!("discv4 oldest node pinger - bucket #{}", bucket_no),
+                {
+                    let connected = this.connected.clone();
+                    let mut egress_requests_tx = this.egress_requests_tx.clone();
+                    async move {
+                        let oldest = connected.lock().oldest(bucket_no as u8);
+
+                        let (tx, rx) = oneshot();
+                        if let Some(node) = oldest {
+                            if egress_requests_tx
+                                .send((
+                                    node.udp_addr(),
+                                    id,
+                                    EgressMessage::Ping(
+                                        PingMessage {
+                                            from: node_endpoint,
+                                            to: node.into(),
+                                            expire: ping_expiry(),
+                                        },
+                                        Some(tx),
+                                    ),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+
+                            if rx.await.is_err() {
+                                connected.lock().remove(node.id);
+                            }
+                        }
+                    }
+                },
+            );
+        }
+
         Ok(this)
     }
 
     #[instrument(skip(self))]
     pub async fn lookup(&self, target: NodeId) -> Vec<NodeRecord> {
         struct QueryNode {
-            node: NodeRecord,
+            record: NodeRecord,
             queried: bool,
         }
 
+        let node_endpoint = self.node_endpoint;
         let egress_requests_tx = self.egress_requests_tx.clone();
 
         // Get all nodes from local table sorted by distance
@@ -477,11 +545,11 @@ impl Node {
             .lock()
             .nearest_node_entries(target)
             .into_iter()
-            .map(|(distance, node)| {
+            .map(|(distance, record)| {
                 (
                     distance,
                     QueryNode {
-                        node,
+                        record,
                         queried: false,
                     },
                 )
@@ -500,19 +568,39 @@ impl Node {
                     // ...send find node request...
                     node.queried = true;
                     let mut egress_requests_tx = egress_requests_tx.clone();
-                    timeout(PING_TIMEOUT, async move {
+                    timeout(FIND_NODE_TIMEOUT, async move {
+                        // Make sure our endpoint is proven.
+                        // TODO: cache this.
                         let (tx, rx) = oneshot();
                         let _ = egress_requests_tx
                             .send((
-                                SocketAddr::new(node.node.address, node.node.udp_port),
-                                node.node.id,
-                                EgressMessage::FindNode((
+                                SocketAddr::new(node.record.address, node.record.udp_port),
+                                node.record.id,
+                                EgressMessage::Ping(
+                                    PingMessage {
+                                        from: node_endpoint,
+                                        to: node.record.into(),
+                                        expire: ping_expiry(),
+                                    },
+                                    Some(tx),
+                                ),
+                            ))
+                            .await;
+                        // ...and await for Pong response
+                        rx.await.ok()?;
+
+                        let (tx, rx) = oneshot();
+                        let _ = egress_requests_tx
+                            .send((
+                                SocketAddr::new(node.record.address, node.record.udp_port),
+                                node.record.id,
+                                EgressMessage::FindNode(
                                     FindNodeMessage {
                                         id: target,
                                         expire: find_node_expiry(),
                                     },
                                     Some(tx),
-                                )),
+                                ),
                             ))
                             .await;
                         // ...and await for Neighbours response
@@ -522,15 +610,15 @@ impl Node {
             for message in join_all(fut).await {
                 if let Ok(Some(message)) = message {
                     // If we have a node...
-                    for node in message.nodes.into_iter() {
+                    for record in message.nodes.into_iter() {
                         // ...and it's not been seen yet...
                         if let Entry::Vacant(vacant) =
-                            nearest_nodes.entry(distance(target, node.id))
+                            nearest_nodes.entry(distance(target, record.id))
                         {
                             // ...add to the set and continue the query
                             found_nodes = true;
                             vacant.insert(QueryNode {
-                                node,
+                                record,
                                 queried: false,
                             });
                         }
@@ -548,7 +636,7 @@ impl Node {
 
         nearest_nodes
             .into_iter()
-            .map(|(_, node)| node.node)
+            .map(|(_, node)| node.record)
             .collect()
     }
 }

@@ -96,8 +96,18 @@ impl Table {
         None
     }
 
+    pub fn oldest(&self, bucket_no: u8) -> Option<NodeRecord> {
+        let b = &self.kbuckets[bucket_no as usize];
+
+        if !b.bucket.is_empty() {
+            return Some(b.bucket[b.bucket.len() - 1]);
+        }
+
+        None
+    }
+
     /// Add verified peer if there is space.
-    #[instrument]
+    #[instrument(skip(self))]
     pub fn add_verified(&mut self, peer: NodeRecord) {
         trace!("Adding peer");
         if let Some(bucket) = self.bucket_mut(peer.id) {
@@ -116,7 +126,7 @@ impl Table {
     }
 
     /// Add seen peer if there is space.
-    #[instrument]
+    #[instrument(skip(self))]
     pub fn add_seen(&mut self, peer: NodeRecord) {
         trace!("Adding peer");
         if let Some(bucket) = self.bucket_mut(peer.id) {
