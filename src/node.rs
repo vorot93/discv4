@@ -2,7 +2,7 @@ use crate::{kad::*, message::*, proto::*, util::*, PeerId};
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
-use futures::SinkExt;
+use futures::{future::join_all, SinkExt};
 use k256::ecdsa::{
     recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
     signature::{DigestSigner, Signature as _},
@@ -14,7 +14,7 @@ use primitive_types::H256;
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
 use std::{
-    collections::HashMap,
+    collections::{btree_map::Entry, BTreeMap, HashMap},
     convert::TryFrom,
     iter::once,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -27,8 +27,11 @@ use thiserror::Error;
 use tokio::{
     net::UdpSocket,
     stream::StreamExt,
-    sync::{mpsc::channel, oneshot::Sender as OneshotSender},
-    time::DelayQueue,
+    sync::{
+        mpsc::{channel, Sender},
+        oneshot::{channel as oneshot, Sender as OneshotSender},
+    },
+    time::{delay_for, timeout, DelayQueue},
 };
 use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 use tracing::*;
@@ -37,6 +40,19 @@ use url::{Host, Url};
 pub const MAX_PACKET_SIZE: usize = 1280;
 pub const TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 pub const PING_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn expiry(timeout: Duration) -> u64 {
+    u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception")
+        + timeout.as_secs()
+}
+
+fn find_node_expiry() -> u64 {
+    expiry(FIND_NODE_TIMEOUT)
+}
+
+pub const ALPHA: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct NodeRecord {
@@ -114,6 +130,8 @@ pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
     outstanding_pings: Arc<Mutex<H256Set>>,
+
+    egress_requests_tx: Sender<(SocketAddr, PeerId, EgressMessage)>,
 }
 
 enum PreTrigger {
@@ -132,7 +150,7 @@ impl Node {
         bootstrap_nodes: Vec<NodeRecord>,
         public_address: Option<IpAddr>,
         tcp_port: u16,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Arc<Self>> {
         let node_endpoint = Endpoint {
             address: public_address.unwrap_or(addr.ip()),
             udp_port: addr.port(),
@@ -146,8 +164,6 @@ impl Node {
             UdpSocket::bind(&addr).await?,
             BytesCodec::new(),
         ));
-
-        // let (mut udp_rx, mut udp_tx) = UdpSocket::bind(&addr).await?.split();
 
         let (egress_requests_tx, mut egress_requests) = channel(1);
 
@@ -165,7 +181,7 @@ impl Node {
             let outstanding_pings = outstanding_pings.clone();
             let inflight_find_node_requests = inflight_find_node_requests.clone();
             async move {
-                while let Some((peer, message, addr)) = egress_requests.next().await {
+                while let Some((addr, peer, message)) = egress_requests.next().await {
                     let mut pre_trigger = None;
                     let mut post_trigger = None;
                     let mut typdata = match message {
@@ -220,7 +236,7 @@ impl Node {
                                         let connected = connected.clone();
                                         let outstanding_pings = outstanding_pings.clone();
                                         async move {
-                                            tokio::time::delay_for(PING_TIMEOUT).await;
+                                            delay_for(PING_TIMEOUT).await;
                                             let mut connected = connected.lock();
                                             let mut outstanding_pings = outstanding_pings.lock();
                                             if outstanding_pings.remove(&hash) {
@@ -236,7 +252,7 @@ impl Node {
                                         let inflight_find_node_requests =
                                             inflight_find_node_requests.clone();
                                         async move {
-                                            tokio::time::delay_for(PING_TIMEOUT).await;
+                                            delay_for(PING_TIMEOUT).await;
                                             inflight_find_node_requests.lock().remove(&peer);
                                         }
                                     });
@@ -307,16 +323,16 @@ impl Node {
 
                                         let _ = egress_requests_tx
                                             .send((
+                                                SocketAddr::new(
+                                                    ping_data.to.address,
+                                                    ping_data.to.udp_port,
+                                                ),
                                                 remote_id,
                                                 EgressMessage::Pong(PongMessage {
                                                     to: ping_data.from,
                                                     echo: hash,
                                                     expire: ping_data.expire,
                                                 }),
-                                                SocketAddr::new(
-                                                    ping_data.to.address,
-                                                    ping_data.to.udp_port,
-                                                ),
                                             ))
                                             .await;
                                     }
@@ -340,12 +356,12 @@ impl Node {
                                         if let Some(nodes) = neighbours {
                                             let _ = egress_requests_tx
                                                 .send((
+                                                    addr,
                                                     remote_id,
                                                     EgressMessage::Neighbours(NeighboursMessage {
                                                         nodes,
                                                         expire: message.expire,
                                                     }),
-                                                    addr,
                                                 ))
                                                 .await;
                                         }
@@ -402,11 +418,11 @@ impl Node {
                                 TimeoutEvent::Stale => {
                                     let to = connected.lock().get(node);
                                     if let Some(to) = to {
-                                        let _ = egress_requests_tx.send((node, EgressMessage::Ping(PingMessage {
+                                        let _ = egress_requests_tx.send((SocketAddr::new(to.address, to.udp_port), node, EgressMessage::Ping(PingMessage {
                                             from: node_endpoint,
                                             to,
                                             expire: u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception") + PING_TIMEOUT.as_secs()
-                                        }), SocketAddr::from((to.address, to.udp_port)))).await;
+                                        }))).await;
 
                                         mapping.insert(node, pending_timeouts.insert((TimeoutEvent::Stale, node), PING_TIMEOUT));
                                     }
@@ -432,10 +448,104 @@ impl Node {
             }
         });
 
-        Ok(Self {
+        let this = Arc::new(Self {
             task_group,
             connected,
             outstanding_pings,
-        })
+            egress_requests_tx,
+        });
+
+        this.task_group.spawn_with_name("discv4 refresher", {
+            let this = Arc::downgrade(&this);
+            async move {
+                while let Some(this) = this.upgrade() {
+                    this.lookup(id).await;
+                    drop(this);
+
+                    delay_for(REFRESH_TIMEOUT).await;
+                }
+            }
+        });
+
+        Ok(this)
+    }
+
+    #[instrument(skip(self))]
+    pub async fn lookup(&self, target: PeerId) -> Vec<Neighbour> {
+        struct QueryNode {
+            node: Neighbour,
+            queried: bool,
+        }
+
+        let egress_requests_tx = self.egress_requests_tx.clone();
+
+        let mut nearest_nodes = self
+            .connected
+            .lock()
+            .nearest_node_entries(target)
+            .into_iter()
+            .map(|(distance, node)| {
+                (
+                    distance,
+                    QueryNode {
+                        node,
+                        queried: false,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut lookup_round = 0_usize;
+        loop {
+            trace!("Lookup round #{}", lookup_round);
+            let mut found_nodes = false;
+            let fut = nearest_nodes.iter_mut().take(ALPHA).map(|(_, node)| {
+                node.queried = true;
+                let mut egress_requests_tx = egress_requests_tx.clone();
+                timeout(PING_TIMEOUT, async move {
+                    let (tx, rx) = oneshot();
+                    let _ = egress_requests_tx
+                        .send((
+                            SocketAddr::new(node.node.address, node.node.udp_port),
+                            node.node.id,
+                            EgressMessage::FindNode((
+                                FindNodeMessage {
+                                    id: target,
+                                    expire: find_node_expiry(),
+                                },
+                                Some(tx),
+                            )),
+                        ))
+                        .await;
+                    rx.await.ok()
+                })
+            });
+            for message in join_all(fut).await {
+                if let Ok(Some(message)) = message {
+                    for node in message.nodes.into_iter() {
+                        if let Entry::Vacant(vacant) =
+                            nearest_nodes.entry(distance(target, node.id))
+                        {
+                            found_nodes = true;
+                            vacant.insert(QueryNode {
+                                node,
+                                queried: false,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Round did not yield any closer nodes.
+            if !found_nodes {
+                break;
+            }
+
+            lookup_round += 1;
+        }
+
+        nearest_nodes
+            .into_iter()
+            .map(|(_, node)| node.node)
+            .collect()
     }
 }

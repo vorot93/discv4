@@ -2,11 +2,15 @@ use crate::{message::*, util::*, PeerId};
 use array_init::array_init;
 use arrayvec::ArrayVec;
 use primitive_types::H256;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 pub const BUCKET_SIZE: usize = 16;
 pub const REPLACEMENTS_SIZE: usize = 16;
 pub const ADDRESS_BYTES_SIZE: usize = 256;
+
+pub fn distance(n1: PeerId, n2: PeerId) -> H256 {
+    keccak256(n1) ^ keccak256(n2)
+}
 
 #[derive(Default)]
 pub struct KBucket {
@@ -155,17 +159,12 @@ impl Table {
         })
     }
 
-    pub fn nearest_node_entries(&self, target: PeerId) -> Vec<Neighbour> {
-        let mut out = self
-            .kbuckets
+    pub fn nearest_node_entries(&self, target: PeerId) -> BTreeMap<H256, Neighbour> {
+        self.kbuckets
             .iter()
             .map(|bucket| &bucket.bucket)
             .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-
-        out.sort_unstable_by_key(|n| n.id);
-
-        out
+            .map(|n| (distance(n.id, target), *n))
+            .collect()
     }
 }
