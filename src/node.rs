@@ -1,4 +1,4 @@
-use crate::{kad::*, message::*, proto::*, util::*, PeerId};
+use crate::{kad::*, message::*, proto::*, util::*, NodeId};
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
@@ -59,7 +59,7 @@ pub struct NodeRecord {
     pub address: IpAddr,
     pub tcp_port: u16,
     pub udp_port: u16,
-    pub id: PeerId,
+    pub id: NodeId,
 }
 
 #[derive(Debug, Error)]
@@ -122,7 +122,7 @@ pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
 
-    egress_requests_tx: Sender<(SocketAddr, PeerId, EgressMessage)>,
+    egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
 }
 
 enum PreTrigger {
@@ -167,7 +167,7 @@ impl Node {
         let outstanding_pings = Arc::new(Mutex::new(H256Set::default()));
 
         let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
-            PeerId,
+            NodeId,
             Option<OneshotSender<NeighboursMessage>>,
         >::default()));
 
@@ -463,7 +463,7 @@ impl Node {
     }
 
     #[instrument(skip(self))]
-    pub async fn lookup(&self, target: PeerId) -> Vec<NodeRecord> {
+    pub async fn lookup(&self, target: NodeId) -> Vec<NodeRecord> {
         struct QueryNode {
             node: NodeRecord,
             queried: bool,

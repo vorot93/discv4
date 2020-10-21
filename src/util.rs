@@ -1,4 +1,4 @@
-use crate::PeerId;
+use crate::NodeId;
 use k256::{ecdsa::VerifyKey, EncodedPoint};
 use plain_hasher::PlainHasher;
 use primitive_types::H256;
@@ -11,6 +11,6 @@ pub fn keccak256<T: AsRef<[u8]>>(data: T) -> H256 {
     H256::from(Keccak256::digest(data.as_ref()).as_ref())
 }
 
-pub fn pk2id(pk: &VerifyKey) -> PeerId {
-    PeerId::from_slice(&*EncodedPoint::from(pk).to_untagged_bytes().unwrap())
+pub fn pk2id(pk: &VerifyKey) -> NodeId {
+    NodeId::from_slice(&*EncodedPoint::from(pk).to_untagged_bytes().unwrap())
 }

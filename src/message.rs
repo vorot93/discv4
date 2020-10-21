@@ -1,4 +1,4 @@
-use crate::{kad::NodeBucket, NodeRecord, PeerId};
+use crate::{kad::NodeBucket, NodeId, NodeRecord};
 use arrayref::array_ref;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
@@ -101,7 +101,7 @@ impl From<NodeRecord> for Endpoint {
 
 #[derive(Clone, Copy, Debug, RlpEncodable, RlpDecodable)]
 pub struct FindNodeMessage {
-    pub id: PeerId,
+    pub id: NodeId,
     pub expire: u64,
 }
 

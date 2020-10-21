@@ -8,5 +8,5 @@ mod util;
 
 use primitive_types::H512;
 
-pub type PeerId = H512;
+pub type NodeId = H512;
 pub use crate::node::{Node, NodeRecord};

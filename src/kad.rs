@@ -1,14 +1,15 @@
-use crate::{message::*, util::*, NodeRecord, PeerId};
+use crate::{message::*, util::*, NodeId, NodeRecord};
 use array_init::array_init;
 use arrayvec::ArrayVec;
 use primitive_types::H256;
 use std::collections::{BTreeMap, VecDeque};
+use tracing::*;
 
 pub const BUCKET_SIZE: usize = 16;
 pub const REPLACEMENTS_SIZE: usize = 16;
 pub const ADDRESS_BYTES_SIZE: usize = 256;
 
-pub fn distance(n1: PeerId, n2: PeerId) -> H256 {
+pub fn distance(n1: NodeId, n2: NodeId) -> H256 {
     keccak256(n1) ^ keccak256(n2)
 }
 
@@ -21,7 +22,7 @@ pub struct KBucket {
 }
 
 impl KBucket {
-    pub fn find_peer_pos(&self, peer: PeerId) -> Option<usize> {
+    pub fn find_peer_pos(&self, peer: NodeId) -> Option<usize> {
         for i in 0..self.bucket.len() {
             if self.bucket[i].id == peer {
                 return Some(i);
@@ -44,14 +45,14 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(id: PeerId) -> Self {
+    pub fn new(id: NodeId) -> Self {
         Self {
             id_hash: keccak256(id),
             kbuckets: array_init(|_| Default::default()),
         }
     }
 
-    fn logdistance(&self, peer: PeerId) -> Option<usize> {
+    fn logdistance(&self, peer: NodeId) -> Option<usize> {
         let remote_hash = keccak256(peer);
         for i in (0..ADDRESS_BYTES_SIZE).rev() {
             let byte_index = ADDRESS_BYTES_SIZE - i - 1;
@@ -64,7 +65,7 @@ impl Table {
         None // n1 and n2 are equal, so logdistance is -inf
     }
 
-    fn bucket(&self, peer: PeerId) -> Option<&KBucket> {
+    fn bucket(&self, peer: NodeId) -> Option<&KBucket> {
         if let Some(distance) = self.logdistance(peer) {
             return Some(&self.kbuckets[distance]);
         }
@@ -72,7 +73,7 @@ impl Table {
         None
     }
 
-    fn bucket_mut(&mut self, peer: PeerId) -> Option<&mut KBucket> {
+    fn bucket_mut(&mut self, peer: NodeId) -> Option<&mut KBucket> {
         if let Some(distance) = self.logdistance(peer) {
             return Some(&mut self.kbuckets[distance]);
         }
@@ -80,7 +81,7 @@ impl Table {
         None
     }
 
-    pub fn get(&self, peer: PeerId) -> Option<Endpoint> {
+    pub fn get(&self, peer: NodeId) -> Option<Endpoint> {
         if let Some(bucket) = self.bucket(peer) {
             for entry in &bucket.bucket {
                 if entry.id == peer {
@@ -128,7 +129,7 @@ impl Table {
     }
 
     /// Remove node from the bucket
-    pub fn remove(&mut self, peer: PeerId) -> bool {
+    pub fn remove(&mut self, peer: NodeId) -> bool {
         if let Some(bucket) = self.bucket_mut(peer) {
             for i in 0..bucket.bucket.len() {
                 if bucket.bucket[i].id == peer {
@@ -145,7 +146,7 @@ impl Table {
         false
     }
 
-    pub fn neighbours(&self, peer: PeerId) -> Option<NodeBucket> {
+    pub fn neighbours(&self, peer: NodeId) -> Option<NodeBucket> {
         self.bucket(peer).map(|bucket| {
             bucket
                 .bucket
@@ -161,7 +162,7 @@ impl Table {
         })
     }
 
-    pub fn nearest_node_entries(&self, target: PeerId) -> BTreeMap<H256, NodeRecord> {
+    pub fn nearest_node_entries(&self, target: NodeId) -> BTreeMap<H256, NodeRecord> {
         self.kbuckets
             .iter()
             .map(|bucket| &bucket.bucket)
