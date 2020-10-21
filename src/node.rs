@@ -158,7 +158,12 @@ impl Node {
 
         let (egress_requests_tx, mut egress_requests) = channel(1);
 
-        let connected = Arc::new(Mutex::new(Table::new(id)));
+        let mut table = Table::new(id);
+        for node in bootstrap_nodes {
+            table.add_verified(node);
+        }
+
+        let connected = Arc::new(Mutex::new(table));
         let outstanding_pings = Arc::new(Mutex::new(H256Set::default()));
 
         let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
