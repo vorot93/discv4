@@ -7,7 +7,9 @@ use tracing::*;
 
 pub const BUCKET_SIZE: usize = 16;
 pub const REPLACEMENTS_SIZE: usize = 16;
-pub const ADDRESS_BYTES_SIZE: usize = 256;
+
+const ADDRESS_BYTES_SIZE: usize = 32;
+pub const ADDRESS_BITS: usize = 8 * ADDRESS_BYTES_SIZE;
 
 pub fn distance(n1: NodeId, n2: NodeId) -> H256 {
     keccak256(n1) ^ keccak256(n2)
@@ -42,7 +44,7 @@ impl KBucket {
 #[derive(Debug)]
 pub struct Table {
     id_hash: H256,
-    kbuckets: [KBucket; ADDRESS_BYTES_SIZE],
+    kbuckets: [KBucket; ADDRESS_BITS],
 }
 
 impl Table {
