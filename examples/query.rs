@@ -1,6 +1,10 @@
+use std::time::Duration;
+
 use discv4::{Node, NodeRecord};
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
+use tokio::time::delay_for;
+use tracing::*;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -27,7 +31,7 @@ async fn main() {
 
     let addr = "0.0.0.0:50505".parse().unwrap();
 
-    let _client = Node::new(
+    let node = Node::new(
         addr,
         SigningKey::random(&mut OsRng),
         BOOTSTRAP_NODES
@@ -40,24 +44,15 @@ async fn main() {
     .await
     .unwrap();
 
-    // tokio_compat::run_std(async move {
-    //     loop {
-    //         match Timeout::new(client.try_next().boxed().compat(), Duration::new(SEC, DUR))
-    //             .compat()
-    //             .await
-    //         {
-    //             Ok(peer) => {
-    //                 println!("new peer: {:?}", peer);
-    //             }
-    //             Err(err) => {
-    //                 if err.is_elapsed() {
-    //                     println!("timed out, requesting new peer ...");
-    //                     client.send(DPTMessage::RequestNewPeer).await.unwrap();
-    //                 } else {
-    //                     panic!(err);
-    //                 }
-    //             }
-    //         }
-    //     }
-    // })
+    loop {
+        let target = rand::random();
+        info!("Looking up random target: {}", target);
+        let result = node.lookup(target).await;
+
+        for entry in result {
+            info!("Found node: {:?}", entry);
+        }
+
+        delay_for(Duration::from_secs(5)).await;
+    }
 }
