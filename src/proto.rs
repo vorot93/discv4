@@ -10,6 +10,7 @@ pub enum MessageId {
     Neighbours = 4,
 }
 
+#[derive(Debug)]
 pub enum EgressMessage {
     Ping(PingMessage, Option<OneshotSender<()>>),
     Pong(PongMessage),

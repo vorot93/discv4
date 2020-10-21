@@ -106,41 +106,41 @@ impl Table {
         None
     }
 
-    /// Add verified peer if there is space.
-    #[instrument(skip(self))]
-    pub fn add_verified(&mut self, peer: NodeRecord) {
+    /// Add verified node if there is space.
+    #[instrument(skip(self, node), fields(node = &*node.id.to_string()))]
+    pub fn add_verified(&mut self, node: NodeRecord) {
         trace!("Adding peer");
-        if let Some(bucket) = self.bucket_mut(peer.id) {
-            if let Some(pos) = bucket.find_peer_pos(peer.id) {
+        if let Some(bucket) = self.bucket_mut(node.id) {
+            if let Some(pos) = bucket.find_peer_pos(node.id) {
                 bucket.bucket.remove(pos);
             }
 
             // Push to front of bucket if we have less than BUCKET_SIZE peers, or we are shuffling existing peer...
             if bucket.bucket.len() < BUCKET_SIZE {
-                bucket.bucket.push_front(peer);
+                bucket.bucket.push_front(node);
             } else {
                 // ...add to replacements otherwise
-                bucket.push_replacement(peer);
+                bucket.push_replacement(node);
             }
         }
     }
 
-    /// Add seen peer if there is space.
-    #[instrument(skip(self))]
-    pub fn add_seen(&mut self, peer: NodeRecord) {
+    /// Add seen node if there is space.
+    #[instrument(skip(self, node), fields(node = &*node.id.to_string()))]
+    pub fn add_seen(&mut self, node: NodeRecord) {
         trace!("Adding peer");
-        if let Some(bucket) = self.bucket_mut(peer.id) {
-            if bucket.find_peer_pos(peer.id).is_some() {
+        if let Some(bucket) = self.bucket_mut(node.id) {
+            if bucket.find_peer_pos(node.id).is_some() {
                 // Peer exists already, do nothing
                 return;
             }
 
             // Push to back of bucket if we have less than BUCKET_SIZE peers...
             if bucket.bucket.len() < BUCKET_SIZE {
-                bucket.bucket.push_back(peer);
+                bucket.bucket.push_back(node);
             } else {
                 // ...add to replacements otherwise
-                bucket.push_replacement(peer);
+                bucket.push_replacement(node);
             }
         }
     }

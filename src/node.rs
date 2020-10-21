@@ -179,7 +179,7 @@ impl Node {
             NodeId,
             Option<OneshotSender<NeighboursMessage>>,
         >::default()));
-        let inflight_ping_requests = Arc::new(Mutex::new(H256Map::default()));
+        let inflight_ping_requests = Arc::new(Mutex::new(H256Map::<Vec<_>>::default()));
 
         task_group.spawn_with_name("discv4 egress router", {
             let task_group = Arc::downgrade(&task_group);
@@ -188,92 +188,114 @@ impl Node {
             let inflight_ping_requests = inflight_ping_requests.clone();
             async move {
                 while let Some((addr, peer, message)) = egress_requests.next().await {
-                    let mut pre_trigger = None;
-                    let mut post_trigger = None;
-                    let mut typdata = match message {
-                        EgressMessage::Ping(message, sender) => {
-                            pre_trigger = Some(PreTrigger::Ping(sender));
-                            post_trigger = Some(PostSendTrigger::Ping);
-                            once(1).chain(rlp::encode(&message)).collect()
+                    async {
+                        trace!("Sending datagram {:?}", message);
+
+                        let mut pre_trigger = None;
+                        let mut post_trigger = None;
+                        let mut typdata = match message {
+                            EgressMessage::Ping(message, sender) => {
+                                pre_trigger = Some(PreTrigger::Ping(sender));
+                                post_trigger = Some(PostSendTrigger::Ping);
+                                once(1).chain(rlp::encode(&message)).collect()
+                            }
+                            EgressMessage::Pong(message) => {
+                                once(2).chain(rlp::encode(&message)).collect()
+                            }
+                            EgressMessage::FindNode(message, sender) => {
+                                pre_trigger = Some(PreTrigger::FindNode(sender));
+                                post_trigger = Some(PostSendTrigger::FindNode);
+                                once(3).chain(rlp::encode(&message)).collect()
+                            }
+                            EgressMessage::Neighbours(message) => {
+                                once(4).chain(rlp::encode(&message)).collect()
+                            }
+                        };
+
+                        let signature: RecoverableSignature =
+                            secret_key.sign_digest(Keccak256::new().chain(&typdata));
+
+                        let mut hashdata = signature.as_bytes().to_vec();
+                        hashdata.append(&mut typdata);
+
+                        let hash = keccak256(&hashdata);
+
+                        let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
+                        datagram.extend_from_slice(hash.as_bytes());
+                        datagram.extend_from_slice(&hashdata);
+
+                        let mut do_send = false;
+                        match pre_trigger {
+                            Some(PreTrigger::Ping(sender)) => {
+                                let mut inflight_ping_requests = inflight_ping_requests.lock();
+                                let cbs = inflight_ping_requests.entry(hash).or_insert_with(|| {
+                                    do_send = true;
+                                    Vec::with_capacity(2)
+                                });
+                                if let Some(sender) = sender {
+                                    cbs.push(sender);
+                                }
+                            }
+                            Some(PreTrigger::FindNode(sender)) => {
+                                inflight_find_node_requests.lock().insert(peer, sender);
+                                do_send = true;
+                            }
+                            None => {
+                                do_send = true;
+                            }
                         }
-                        EgressMessage::Pong(message) => {
-                            once(2).chain(rlp::encode(&message)).collect()
+
+                        if !do_send {
+                            return;
                         }
-                        EgressMessage::FindNode(message, sender) => {
-                            pre_trigger = Some(PreTrigger::FindNode(sender));
-                            post_trigger = Some(PostSendTrigger::FindNode);
-                            once(3).chain(rlp::encode(&message)).collect()
-                        }
-                        EgressMessage::Neighbours(message) => {
-                            once(4).chain(rlp::encode(&message)).collect()
-                        }
-                    };
 
-                    let signature: RecoverableSignature =
-                        secret_key.sign_digest(Keccak256::new().chain(&typdata));
-
-                    let mut hashdata = signature.as_bytes().to_vec();
-                    hashdata.append(&mut typdata);
-
-                    let hash = keccak256(&hashdata);
-
-                    let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
-                    datagram.extend_from_slice(hash.as_bytes());
-                    datagram.extend_from_slice(&hashdata);
-
-                    trace!(
-                        "Sending datagram to peer {}: {}",
-                        peer,
-                        hex::encode(&datagram)
-                    );
-
-                    match pre_trigger {
-                        Some(PreTrigger::FindNode(sender)) => {
-                            inflight_find_node_requests.lock().insert(peer, sender);
-                        }
-                        Some(PreTrigger::Ping(sender)) => {
-                            inflight_ping_requests.lock().insert(hash, sender);
-                        }
-                        None => {}
-                    }
-
-                    if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
-                        warn!("UDP socket send failure: {}", e);
-                        return;
-                    } else if let Some(trigger) = post_trigger {
-                        match trigger {
-                            PostSendTrigger::Ping => {
-                                if let Some(task_group) = task_group.upgrade() {
-                                    task_group.spawn({
-                                        let connected = connected.clone();
-                                        let inflight_ping_requests = inflight_ping_requests.clone();
-                                        async move {
-                                            delay_for(PING_TIMEOUT).await;
-                                            let mut connected = connected.lock();
-                                            let mut inflight_ping_requests =
-                                                inflight_ping_requests.lock();
-                                            if inflight_ping_requests.remove(&hash).is_some() {
-                                                connected.remove(peer);
+                        if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
+                            warn!("UDP socket send failure: {}", e);
+                            return;
+                        } else if let Some(trigger) = post_trigger {
+                            match trigger {
+                                PostSendTrigger::Ping => {
+                                    if let Some(task_group) = task_group.upgrade() {
+                                        task_group.spawn({
+                                            let connected = connected.clone();
+                                            let inflight_ping_requests =
+                                                inflight_ping_requests.clone();
+                                            async move {
+                                                delay_for(PING_TIMEOUT).await;
+                                                let mut connected = connected.lock();
+                                                let mut inflight_ping_requests =
+                                                    inflight_ping_requests.lock();
+                                                if inflight_ping_requests.remove(&hash).is_some() {
+                                                    connected.remove(peer);
+                                                }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
-                            }
-                            PostSendTrigger::FindNode => {
-                                if let Some(task_group) = task_group.upgrade() {
-                                    // TODO: move to timeout tracker
-                                    task_group.spawn({
-                                        let inflight_find_node_requests =
-                                            inflight_find_node_requests.clone();
-                                        async move {
-                                            delay_for(FIND_NODE_TIMEOUT).await;
-                                            inflight_find_node_requests.lock().remove(&peer);
-                                        }
-                                    });
+                                PostSendTrigger::FindNode => {
+                                    if let Some(task_group) = task_group.upgrade() {
+                                        // TODO: move to timeout tracker
+                                        task_group.spawn({
+                                            let inflight_find_node_requests =
+                                                inflight_find_node_requests.clone();
+                                            async move {
+                                                delay_for(FIND_NODE_TIMEOUT).await;
+                                                inflight_find_node_requests.lock().remove(&peer);
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
+                    .instrument(span!(
+                        Level::TRACE,
+                        "egress sender",
+                        "addr={},node={}",
+                        addr,
+                        &*peer.to_string(),
+                    ))
+                    .await;
                 }
             }
         });
@@ -291,7 +313,6 @@ impl Node {
                             break;
                         }
                         Ok((buf, addr)) => {
-                            trace!("Received message from {}: {}", addr, hex::encode(&buf));
                             if let Err(e) = async {
                                 let min_len = 32 + 65 + 1;
 
@@ -324,6 +345,8 @@ impl Node {
 
                                 let _ = seen_tx.send(remote_id).await;
 
+                                trace!("Typ: {}", typ);
+
                                 match MessageId::from_u8(typ) {
                                     Some(MessageId::Ping) => {
                                         let ping_data = Rlp::new(data).as_val::<PingMessage>()?;
@@ -354,10 +377,10 @@ impl Node {
                                         let message = Rlp::new(data).as_val::<PongMessage>()?;
 
                                         // Did we actually ask for this? Ignore message if not.
-                                        if let Some(cb) =
+                                        if let Some(cbs) =
                                             inflight_ping_requests.lock().remove(&message.echo)
                                         {
-                                            if let Some(cb) = cb {
+                                            for cb in cbs {
                                                 let _ = cb.send(());
                                             }
                                         }
@@ -407,6 +430,8 @@ impl Node {
                                             if let Some(cb) = cb {
                                                 let _ = cb.send(message);
                                             }
+                                        } else {
+                                            trace!("Ignoring neighbours")
                                         }
                                     }
                                     None => bail!("Invalid message type: {}", typ),
@@ -414,6 +439,12 @@ impl Node {
 
                                 Ok(())
                             }
+                            .instrument(span!(
+                                Level::TRACE,
+                                "ingress handler",
+                                "addr={}",
+                                &*addr.to_string()
+                            ))
                             .await
                             {
                                 warn!("Failed to handle message from {}: {}", addr, e);
@@ -422,6 +453,7 @@ impl Node {
                     }
                 }
             }
+            .instrument(span!(Level::TRACE, "ingress router"))
         });
 
         task_group.spawn_with_name("discv4 timeout tracker", {
@@ -479,10 +511,12 @@ impl Node {
             let this = Arc::downgrade(&this);
             async move {
                 while let Some(this) = this.upgrade() {
+                    delay_for(REFRESH_TIMEOUT / 4).await;
+
                     this.lookup(id).await;
                     drop(this);
 
-                    delay_for(REFRESH_TIMEOUT).await;
+                    delay_for(3 * REFRESH_TIMEOUT / 4).await;
                 }
             }
         });
@@ -529,8 +563,9 @@ impl Node {
         Ok(this)
     }
 
-    #[instrument(skip(self))]
+    #[instrument(skip(self, target), fields(target=&*target.to_string()))]
     pub async fn lookup(&self, target: NodeId) -> Vec<NodeRecord> {
+        #[derive(Clone, Copy)]
         struct QueryNode {
             record: NodeRecord,
             queried: bool,
@@ -557,7 +592,7 @@ impl Node {
             .collect::<BTreeMap<_, _>>();
         let mut lookup_round = 0_usize;
         loop {
-            trace!("Lookup round #{}", lookup_round);
+            debug!("Lookup round #{}", lookup_round);
             let mut found_nodes = false;
             // For each node of ALPHA closest and not queried yet...
             let fut = nearest_nodes
@@ -567,48 +602,83 @@ impl Node {
                 .map(|(_, node)| {
                     // ...send find node request...
                     node.queried = true;
-                    let mut egress_requests_tx = egress_requests_tx.clone();
-                    timeout(FIND_NODE_TIMEOUT, async move {
-                        // Make sure our endpoint is proven.
-                        // TODO: cache this.
-                        let (tx, rx) = oneshot();
-                        let _ = egress_requests_tx
-                            .send((
-                                SocketAddr::new(node.record.address, node.record.udp_port),
-                                node.record.id,
-                                EgressMessage::Ping(
-                                    PingMessage {
-                                        from: node_endpoint,
-                                        to: node.record.into(),
-                                        expire: ping_expiry(),
-                                    },
-                                    Some(tx),
-                                ),
-                            ))
-                            .await;
-                        // ...and await for Pong response
-                        rx.await.ok()?;
 
-                        let (tx, rx) = oneshot();
-                        let _ = egress_requests_tx
-                            .send((
-                                SocketAddr::new(node.record.address, node.record.udp_port),
-                                node.record.id,
-                                EgressMessage::FindNode(
-                                    FindNodeMessage {
-                                        id: target,
-                                        expire: find_node_expiry(),
-                                    },
-                                    Some(tx),
-                                ),
-                            ))
-                            .await;
-                        // ...and await for Neighbours response
-                        rx.await.ok()
-                    })
+                    let node = *node;
+                    let mut egress_requests_tx = egress_requests_tx.clone();
+                    async move {
+                        match timeout(FIND_NODE_TIMEOUT, async move {
+                            // Make sure our endpoint is proven.
+                            // TODO: cache this.
+                            let (tx, rx) = oneshot();
+                            egress_requests_tx
+                                .send((
+                                    SocketAddr::new(node.record.address, node.record.udp_port),
+                                    node.record.id,
+                                    EgressMessage::Ping(
+                                        PingMessage {
+                                            from: node_endpoint,
+                                            to: node.record.into(),
+                                            expire: ping_expiry(),
+                                        },
+                                        Some(tx),
+                                    ),
+                                ))
+                                .await
+                                .map_err(|_| anyhow!("Sender shutdown"))?;
+                            // ...and await for Pong response
+                            rx.await.map_err(|_| anyhow!("Pong timeout"))?;
+
+                            debug!("Our endpoint is proven");
+
+                            let (tx, rx) = oneshot();
+                            egress_requests_tx
+                                .send((
+                                    SocketAddr::new(node.record.address, node.record.udp_port),
+                                    node.record.id,
+                                    EgressMessage::FindNode(
+                                        FindNodeMessage {
+                                            id: target,
+                                            expire: find_node_expiry(),
+                                        },
+                                        Some(tx),
+                                    ),
+                                ))
+                                .await
+                                .map_err(|_| anyhow!("Sender shutdown"))?;
+
+                            debug!("Awaiting neighbours");
+
+                            // ...and await for Neighbours response
+                            let neighbours = rx.await.map_err(|_| anyhow!("Neighbours timeout"))?;
+
+                            debug!("Received neighbours");
+
+                            Ok::<_, anyhow::Error>(neighbours)
+                        })
+                        .await
+                        {
+                            Ok(Ok(v)) => {
+                                return Some(v);
+                            }
+                            Ok(Err(e)) => {
+                                debug!("Query error: {}", e);
+                            }
+                            Err(_) => {
+                                debug!("Query timeout");
+                            }
+                        }
+
+                        None
+                    }
+                    .instrument(span!(
+                        Level::DEBUG,
+                        "query",
+                        "node={}",
+                        node.record.id
+                    ))
                 });
             for message in join_all(fut).await {
-                if let Ok(Some(message)) = message {
+                if let Some(message) = message {
                     // If we have a node...
                     for record in message.nodes.into_iter() {
                         // ...and it's not been seen yet...
