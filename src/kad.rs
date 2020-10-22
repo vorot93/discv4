@@ -111,6 +111,7 @@ impl Table {
     pub fn add_verified(&mut self, node: NodeRecord) {
         trace!("Adding peer");
         if let Some(bucket) = self.bucket_mut(node.id) {
+            trace!("Adding to bucket: {:?}", bucket);
             if let Some(pos) = bucket.find_peer_pos(node.id) {
                 bucket.bucket.remove(pos);
             }
@@ -146,10 +147,12 @@ impl Table {
     }
 
     /// Remove node from the bucket
-    pub fn remove(&mut self, peer: NodeId) -> bool {
-        if let Some(bucket) = self.bucket_mut(peer) {
+    #[instrument(skip(self, node), fields(node = &*node.to_string()))]
+    pub fn remove(&mut self, node: NodeId) -> bool {
+        trace!("Removing from bucket");
+        if let Some(bucket) = self.bucket_mut(node) {
             for i in 0..bucket.bucket.len() {
-                if bucket.bucket[i].id == peer {
+                if bucket.bucket[i].id == node {
                     bucket.bucket.remove(i);
                     if let Some(node) = bucket.replacements.pop_front() {
                         bucket.bucket.push_back(node);
@@ -192,9 +195,5 @@ impl Table {
         self.kbuckets
             .iter()
             .fold(0, |total, bucket| total + bucket.bucket.len())
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }

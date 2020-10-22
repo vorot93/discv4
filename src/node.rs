@@ -20,10 +20,7 @@ use std::{
     iter::once,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use task_group::TaskGroup;
@@ -35,16 +32,15 @@ use tokio::{
         mpsc::{channel, Sender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
     },
-    time::{delay_for, timeout, DelayQueue},
+    time::{delay_for, timeout},
 };
 use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 use tracing::*;
 use url::{Host, Url};
 
 pub const MAX_PACKET_SIZE: usize = 1280;
-pub const TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
-pub const PING_TIMEOUT: Duration = Duration::from_secs(60);
-pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -123,10 +119,6 @@ impl NodeRecord {
     }
 }
 
-enum TimeoutEvent {
-    Stale,
-}
-
 pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
@@ -194,6 +186,10 @@ impl Node {
             async move {
                 while let Some((addr, peer, message)) = egress_requests.next().await {
                     async {
+                        if peer == id {
+                            return;
+                        }
+
                         trace!("Sending datagram {:?}", message);
 
                         let mut pre_trigger = None;
@@ -295,7 +291,7 @@ impl Node {
                     }
                     .instrument(span!(
                         Level::TRACE,
-                        "egress sender",
+                        "OUT",
                         "addr={},node={}",
                         addr,
                         &*peer.to_string(),
@@ -304,8 +300,6 @@ impl Node {
                 }
             }
         });
-
-        let (mut seen_tx, mut seen_rx) = channel(1);
 
         task_group.spawn_with_name("discv4 ingress router", {
             let mut egress_requests_tx = egress_requests_tx.clone();
@@ -346,10 +340,12 @@ impl Node {
                                 )?;
                                 let remote_id = pk2id(&public_key);
 
+                                if remote_id == id {
+                                    return Ok(());
+                                }
+
                                 let typ = buf[97];
                                 let data = &buf[98..];
-
-                                let _ = seen_tx.send(remote_id).await;
 
                                 match MessageId::from_u8(typ) {
                                     Some(MessageId::Ping) => {
@@ -383,7 +379,7 @@ impl Node {
                                         if let Some(cbs) =
                                             inflight_ping_requests.lock().remove(&message.echo)
                                         {
-                                            trace!("PONG - to: {:?}", message.to);
+                                            trace!("PONG - our endpoint is: {:?}", message.to);
                                             {
                                                 let mut node_endpoint = node_endpoint.write();
                                                 node_endpoint.address = message.to.address;
@@ -455,63 +451,11 @@ impl Node {
 
                                 Ok(())
                             }
-                            .instrument(span!(
-                                Level::TRACE,
-                                "ingress handler",
-                                "addr={}",
-                                &*addr.to_string()
-                            ))
+                            .instrument(span!(Level::TRACE, "IN", "addr={}", &*addr.to_string()))
                             .await
                             {
                                 warn!("Failed to handle message from {}: {}", addr, e);
                             }
-                        }
-                    }
-                }
-            }
-            .instrument(span!(Level::TRACE, "ingress router"))
-        });
-
-        task_group.spawn_with_name("discv4 timeout tracker", {
-            let connected = connected.clone();
-            let mut egress_requests_tx = egress_requests_tx.clone();
-            let node_endpoint = node_endpoint.clone();
-            async move {
-                let mut pending_timeouts = DelayQueue::new();
-                let mut mapping = HashMap::new();
-                loop {
-                    tokio::select! {
-                        Some(Ok(timeoutted)) = pending_timeouts.next() => {
-                            let (event, node) = timeoutted.into_inner();
-                            debug!("node {} timeoutted", node);
-                            mapping.remove(&node);
-
-                            match event {
-                                TimeoutEvent::Stale => {
-                                    let to = connected.lock().get(node);
-                                    if let Some(to) = to {
-                                        let from = *node_endpoint.read();
-                                        let _ = egress_requests_tx.send((SocketAddr::new(to.address, to.udp_port), node, EgressMessage::Ping(PingMessage {
-                                            from,
-                                            to,
-                                            expire: u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception") + PING_TIMEOUT.as_secs()
-                                        }, None))).await;
-
-                                        mapping.insert(node, pending_timeouts.insert((TimeoutEvent::Stale, node), PING_TIMEOUT));
-                                    }
-                                }
-                            }
-                        }
-                        Some(node) = seen_rx.next() => {
-                            // Just seen node, refresh its timeout
-                            if let Some(key) = mapping.remove(&node) {
-                                pending_timeouts.remove(&key);
-                            }
-
-                            mapping.insert(node, pending_timeouts.insert((TimeoutEvent::Stale, node), TIMEOUT));
-                        }
-                        else => {
-                            return;
                         }
                     }
                 }
@@ -572,9 +516,7 @@ impl Node {
                                     return;
                                 }
 
-                                if rx.await.is_err() {
-                                    connected.lock().remove(node.id);
-                                }
+                                let _ = rx.await;
                             }
 
                             delay_for(Duration::from_secs_f32(
@@ -619,15 +561,11 @@ impl Node {
             })
             .collect::<BTreeMap<_, _>>();
         let mut lookup_round = 0_usize;
-        let mut skip = 0;
-        let takeoff = Arc::new(AtomicBool::new(false));
         loop {
             debug!("Lookup round #{}", lookup_round);
-            let mut found_nodes = false;
             // For each node of ALPHA closest and not queried yet...
             let fut = nearest_nodes
                 .iter_mut()
-                .skip(skip)
                 .take(ALPHA)
                 .filter(|(_, node)| !node.queried)
                 .map(|(_, node)| {
@@ -636,7 +574,6 @@ impl Node {
 
                     let node = *node;
                     let mut egress_requests_tx = egress_requests_tx.clone();
-                    let takeoff = takeoff.clone();
                     async move {
                         match timeout(FIND_NODE_TIMEOUT, async move {
                             // Make sure our endpoint is proven.
@@ -683,8 +620,6 @@ impl Node {
                             // ...and await for Neighbours response
                             let neighbours = rx.await.map_err(|_| anyhow!("Neighbours timeout"))?;
 
-                            takeoff.store(false, Ordering::Relaxed);
-
                             debug!("Received neighbours");
 
                             Ok::<_, anyhow::Error>(neighbours)
@@ -711,6 +646,8 @@ impl Node {
                         node.record.id
                     ))
                 });
+
+            let mut found_nodes = false;
             for message in join_all(fut).await {
                 if let Some(message) = message {
                     // If we have a node...
@@ -730,18 +667,9 @@ impl Node {
                 }
             }
 
-            if takeoff.load(Ordering::Relaxed) {
-                // if this round did not yield any new nodes, terminate
-                if !found_nodes {
-                    break;
-                }
-            } else {
-                // Dead bootnodes? Try to skip
-                skip += 3;
-                if skip > nearest_nodes.len() {
-                    // Oh, we skipped all of them - terminate the query, good luck next time.
-                    break;
-                }
+            // if this round did not yield any new nodes, terminate
+            if !found_nodes {
+                break;
             }
 
             lookup_round += 1;
