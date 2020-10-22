@@ -628,7 +628,7 @@ impl Node {
                         // ...and await for Pong response
                         rx.await.map_err(|_| anyhow!("Pong timeout"))?;
 
-                        debug!("Our endpoint is proven");
+                        trace!("Our endpoint is proven");
 
                         // In case the node wants to ping us, give it an opportunity to do so
                         let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
