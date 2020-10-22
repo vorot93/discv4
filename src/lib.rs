@@ -1,5 +1,7 @@
 //! Ethereum Node Discovery v4 implementation.
 
+#![allow(clippy::type_complexity)]
+
 mod kad;
 mod message;
 mod node;

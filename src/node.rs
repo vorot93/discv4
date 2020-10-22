@@ -15,7 +15,7 @@ use rand::{distributions::Standard, rngs::OsRng, Rng};
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashMap},
+    collections::{btree_map, hash_map, BTreeMap, HashMap},
     convert::TryFrom,
     iter::once,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -38,11 +38,14 @@ use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 use tracing::*;
 use url::{Host, Url};
 
+pub type RequestId = u64;
+
 pub const MAX_PACKET_SIZE: usize = 1280;
 pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+pub const QUERY_AWAIT_PING_TIME: Duration = Duration::from_secs(2);
 
 fn expiry(timeout: Duration) -> u64 {
     u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception")
@@ -126,6 +129,7 @@ pub struct Node {
     node_endpoint: Arc<RwLock<Endpoint>>,
 
     egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
+    expected_pings: Arc<Mutex<HashMap<SocketAddr, HashMap<RequestId, OneshotSender<()>>>>>,
 }
 
 enum PreTrigger {
@@ -177,6 +181,10 @@ impl Node {
             Option<OneshotSender<NeighboursMessage>>,
         >::default()));
         let inflight_ping_requests = Arc::new(Mutex::new(H256Map::<Vec<_>>::default()));
+        let expected_pings = Arc::new(Mutex::new(HashMap::<
+            SocketAddr,
+            HashMap<RequestId, OneshotSender<_>>,
+        >::new()));
 
         task_group.spawn_with_name("discv4 egress router", {
             let task_group = Arc::downgrade(&task_group);
@@ -305,6 +313,7 @@ impl Node {
             let mut egress_requests_tx = egress_requests_tx.clone();
             let connected = connected.clone();
             let node_endpoint = node_endpoint.clone();
+            let expected_pings = expected_pings.clone();
             async move {
                 while let Some(res) = udp_rx.next().await {
                     match res {
@@ -371,6 +380,12 @@ impl Node {
                                                 }),
                                             ))
                                             .await;
+
+                                        if let Some(cbs) = expected_pings.lock().remove(&addr) {
+                                            for (_, cb) in cbs {
+                                                let _ = cb.send(());
+                                            }
+                                        }
                                     }
                                     Some(MessageId::Pong) => {
                                         let message = Rlp::new(data).as_val::<PongMessage>()?;
@@ -467,6 +482,7 @@ impl Node {
             connected,
             node_endpoint,
             egress_requests_tx,
+            expected_pings,
         });
 
         this.task_group.spawn_with_name("discv4 refresher", {
@@ -562,102 +578,128 @@ impl Node {
             .collect::<BTreeMap<_, _>>();
         let mut lookup_round = 0_usize;
         loop {
-            debug!("Lookup round #{}", lookup_round);
             // For each node of ALPHA closest and not queried yet...
-            let fut = nearest_nodes
+            let picked_nodes = nearest_nodes
                 .iter_mut()
                 .take(ALPHA)
-                .filter(|(_, node)| !node.queried)
-                .map(|(_, node)| {
-                    // ...send find node request...
-                    node.queried = true;
+                .filter_map(|(_, node)| if !node.queried { Some(node) } else { None })
+                .collect::<Vec<_>>();
 
-                    let node = *node;
-                    let mut egress_requests_tx = egress_requests_tx.clone();
-                    async move {
-                        match timeout(FIND_NODE_TIMEOUT, async move {
-                            // Make sure our endpoint is proven.
-                            // TODO: cache this.
-                            let (tx, rx) = oneshot();
-                            egress_requests_tx
-                                .send((
-                                    SocketAddr::new(node.record.address, node.record.udp_port),
-                                    node.record.id,
-                                    EgressMessage::Ping(
-                                        PingMessage {
-                                            from: node_endpoint,
-                                            to: node.record.into(),
-                                            expire: ping_expiry(),
-                                        },
-                                        Some(tx),
-                                    ),
-                                ))
-                                .await
-                                .map_err(|_| anyhow!("Sender shutdown"))?;
-                            // ...and await for Pong response
-                            rx.await.map_err(|_| anyhow!("Pong timeout"))?;
+            if picked_nodes.is_empty() {
+                debug!("No picked nodes, ending lookup");
+                break;
+            }
 
-                            debug!("Our endpoint is proven");
+            let fut = picked_nodes.into_iter().map(|node| {
+                // ...send find node request...
+                node.queried = true;
+                let node = *node;
+                let mut egress_requests_tx = egress_requests_tx.clone();
+                let expected_pings = self.expected_pings.clone();
+                let expected_ping_id = rand::random();
+                async move {
+                    let addr = SocketAddr::new(node.record.address, node.record.udp_port);
 
-                            let (tx, rx) = oneshot();
-                            egress_requests_tx
-                                .send((
-                                    SocketAddr::new(node.record.address, node.record.udp_port),
-                                    node.record.id,
-                                    EgressMessage::FindNode(
-                                        FindNodeMessage {
-                                            id: target,
-                                            expire: find_node_expiry(),
-                                        },
-                                        Some(tx),
-                                    ),
-                                ))
-                                .await
-                                .map_err(|_| anyhow!("Sender shutdown"))?;
+                    let res = timeout(FIND_NODE_TIMEOUT, async {
+                        let (expected_ping_tx, expected_ping_rx) = oneshot();
+                        expected_pings
+                            .lock()
+                            .entry(addr)
+                            .or_default()
+                            .insert(expected_ping_id, expected_ping_tx);
 
-                            debug!("Awaiting neighbours");
+                        // Make sure our endpoint is proven.
+                        let (tx, rx) = oneshot();
+                        egress_requests_tx
+                            .send((
+                                addr,
+                                node.record.id,
+                                EgressMessage::Ping(
+                                    PingMessage {
+                                        from: node_endpoint,
+                                        to: node.record.into(),
+                                        expire: ping_expiry(),
+                                    },
+                                    Some(tx),
+                                ),
+                            ))
+                            .await
+                            .map_err(|_| anyhow!("Sender shutdown"))?;
+                        // ...and await for Pong response
+                        rx.await.map_err(|_| anyhow!("Pong timeout"))?;
 
-                            // ...and await for Neighbours response
-                            let neighbours = rx.await.map_err(|_| anyhow!("Neighbours timeout"))?;
+                        debug!("Our endpoint is proven");
 
-                            debug!("Received neighbours");
+                        // In case the node wants to ping us, give it an opportunity to do so
+                        let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
 
-                            Ok::<_, anyhow::Error>(neighbours)
-                        })
-                        .await
-                        {
-                            Ok(Ok(v)) => {
-                                return Some(v);
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Query error: {}", e);
-                            }
-                            Err(_) => {
-                                debug!("Query timeout");
-                            }
+                        let (tx, rx) = oneshot();
+                        egress_requests_tx
+                            .send((
+                                addr,
+                                node.record.id,
+                                EgressMessage::FindNode(
+                                    FindNodeMessage {
+                                        id: target,
+                                        expire: find_node_expiry(),
+                                    },
+                                    Some(tx),
+                                ),
+                            ))
+                            .await
+                            .map_err(|_| anyhow!("Sender shutdown"))?;
+
+                        debug!("Awaiting neighbours");
+
+                        // ...and await for Neighbours response
+                        let neighbours = rx.await.map_err(|_| anyhow!("Neighbours timeout"))?;
+
+                        debug!("Received neighbours");
+
+                        Ok::<_, anyhow::Error>(neighbours)
+                    })
+                    .await;
+
+                    if let hash_map::Entry::Occupied(mut entry) = expected_pings.lock().entry(addr)
+                    {
+                        entry.get_mut().remove(&expected_ping_id);
+                        if entry.get().is_empty() {
+                            entry.remove();
                         }
-
-                        None
                     }
-                    .instrument(span!(
-                        Level::DEBUG,
-                        "query",
-                        "node={}",
-                        node.record.id
-                    ))
-                });
 
-            let mut found_nodes = false;
+                    match res {
+                        Ok(Ok(v)) => {
+                            return Some(v);
+                        }
+                        Ok(Err(e)) => {
+                            debug!("Query error: {}", e);
+                        }
+                        Err(_) => {
+                            debug!("Query timeout");
+                        }
+                    }
+
+                    None
+                }
+                .instrument(span!(
+                    Level::DEBUG,
+                    "query",
+                    "#{},node={}",
+                    lookup_round,
+                    node.record.id
+                ))
+            });
+
             for message in join_all(fut).await {
                 if let Some(message) = message {
                     // If we have a node...
                     for record in message.nodes.into_iter() {
                         // ...and it's not been seen yet...
-                        if let Entry::Vacant(vacant) =
+                        if let btree_map::Entry::Vacant(vacant) =
                             nearest_nodes.entry(distance(target, record.id))
                         {
                             // ...add to the set and continue the query
-                            found_nodes = true;
                             vacant.insert(QueryNode {
                                 record,
                                 queried: false,
@@ -665,11 +707,6 @@ impl Node {
                         }
                     }
                 }
-            }
-
-            // if this round did not yield any new nodes, terminate
-            if !found_nodes {
-                break;
             }
 
             lookup_round += 1;

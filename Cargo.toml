@@ -40,7 +40,6 @@ tokio-util = { version = "0.3", features = ["codec", "udp"] }
 tracing = "0.1"
 tracing-futures = "0.2"
 url = "2"
-uuid = { version = "0.8.1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "0.2", features = ["full"] }
