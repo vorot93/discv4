@@ -187,4 +187,14 @@ impl Table {
             .map(|n| (distance(n.id, target), *n))
             .collect()
     }
+
+    pub fn len(&self) -> usize {
+        self.kbuckets
+            .iter()
+            .fold(0, |total, bucket| total + bucket.bucket.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
