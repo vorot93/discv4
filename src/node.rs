@@ -239,7 +239,7 @@ impl Node {
                                 let mut inflight_ping_requests = inflight_ping_requests.lock();
                                 let cbs = inflight_ping_requests.entry(hash).or_insert_with(|| {
                                     do_send = true;
-                                    Vec::with_capacity(2)
+                                    Vec::new()
                                 });
                                 if let Some(sender) = sender {
                                     cbs.push(sender);
