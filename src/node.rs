@@ -366,10 +366,7 @@ impl Node {
 
                                         let _ = egress_requests_tx
                                             .send((
-                                                SocketAddr::new(
-                                                    ping_data.to.address,
-                                                    ping_data.to.udp_port,
-                                                ),
+                                                addr,
                                                 remote_id,
                                                 EgressMessage::Pong(PongMessage {
                                                     to: ping_data.from,
