@@ -28,7 +28,6 @@ use task_group::TaskGroup;
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    select,
     stream::StreamExt,
     sync::{
         mpsc::{channel, Sender},
@@ -50,6 +49,7 @@ pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const QUERY_AWAIT_PING_TIME: Duration = Duration::from_secs(2);
+pub const NEIGHBOURS_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn expiry(timeout: Duration) -> u64 {
     u64::try_from(Utc::now().timestamp()).expect("this would predate the protocol inception")
@@ -587,7 +587,7 @@ impl Node {
             let this = Arc::downgrade(&this);
             async move {
                 while let Some(this) = this.upgrade() {
-                    this.lookup(this.id).await;
+                    this.lookup_self().await;
                     drop(this);
 
                     delay_for(REFRESH_TIMEOUT).await;
@@ -645,8 +645,17 @@ impl Node {
         Ok(this)
     }
 
+    #[instrument(skip(self), fields(self=&*self.id.to_string()))]
+    async fn lookup_self(&self) -> Vec<NodeRecord> {
+        self.lookup_inner(self.id).await
+    }
+
     #[instrument(skip(self, target), fields(target=&*target.to_string()))]
     pub async fn lookup(&self, target: NodeId) -> Vec<NodeRecord> {
+        self.lookup_inner(target).await
+    }
+
+    async fn lookup_inner(&self, target: NodeId) -> Vec<NodeRecord> {
         #[derive(Clone, Copy)]
         struct QueryNode {
             record: NodeRecord,
@@ -739,18 +748,16 @@ impl Node {
                         // In case the node wants to ping us, give it an opportunity to do so
                         let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
 
-                        let (tx, mut rx) = channel(1);
+                        let (tx, rx) = channel(1);
                         let _guard = inflight_find_node_requests.add(node.record.id, tx);
                         egress_requests_tx
                             .send((
                                 addr,
                                 node.record.id,
-                                EgressMessage::FindNode(
-                                    FindNodeMessage {
-                                        id: target,
-                                        expire: find_node_expiry(),
-                                    },
-                                ),
+                                EgressMessage::FindNode(FindNodeMessage {
+                                    id: target,
+                                    expire: find_node_expiry(),
+                                }),
                             ))
                             .await
                             .map_err(|_| anyhow!("Sender shutdown"))?;
@@ -759,16 +766,13 @@ impl Node {
 
                         // ...and await for Neighbours response
                         let mut received_neighbours = Vec::new();
-                        loop {
-                            let timeout = delay_for(Duration::from_secs(2));
-                            select! {
-                                neighbours = rx.recv() => {
-                                    received_neighbours.push(neighbours.expect("we drop the sending channel, not the ingress router"));
-                                }
-                                _ = timeout => {
-                                    break;
-                                }
-                            }
+
+                        let mut rx = rx.timeout(NEIGHBOURS_WAIT_TIMEOUT);
+                        while let Ok(neighbours) = rx.try_next().await {
+                            received_neighbours.push(
+                                neighbours
+                                    .expect("we drop the sending channel, not the ingress router"),
+                            );
                         }
                         if received_neighbours.is_empty() {
                             bail!("No neigbours received");

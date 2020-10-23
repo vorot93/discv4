@@ -44,6 +44,17 @@ async fn main() {
     .await
     .unwrap();
 
+    tokio::spawn({
+        let node = node.clone();
+        async move {
+            loop {
+                info!("Current nodes: {}", node.num_nodes());
+
+                delay_for(Duration::from_secs(5)).await;
+            }
+        }
+    });
+
     loop {
         let target = rand::random();
         info!("Looking up random target: {}", target);
