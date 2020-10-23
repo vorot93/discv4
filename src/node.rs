@@ -689,6 +689,7 @@ impl Node {
             // For each node of ALPHA closest and not queried yet...
             let picked_nodes = nearest_nodes
                 .iter_mut()
+                .take(ALPHA)
                 .filter_map(|(distance, node)| {
                     if !node.queried {
                         Some((*distance, node))
@@ -696,7 +697,6 @@ impl Node {
                         None
                     }
                 })
-                .take(ALPHA)
                 .collect::<Vec<_>>();
 
             if picked_nodes.is_empty() {
