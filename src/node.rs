@@ -43,7 +43,7 @@ pub type RequestId = u64;
 
 pub const MAX_PACKET_SIZE: usize = 1280;
 pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
-pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const QUERY_AWAIT_PING_TIME: Duration = Duration::from_secs(2);
@@ -489,12 +489,10 @@ impl Node {
             let this = Arc::downgrade(&this);
             async move {
                 while let Some(this) = this.upgrade() {
-                    delay_for(REFRESH_TIMEOUT / 4).await;
-
                     this.lookup(this.id).await;
                     drop(this);
 
-                    delay_for(3 * REFRESH_TIMEOUT / 4).await;
+                    delay_for(REFRESH_TIMEOUT).await;
                 }
             }
         });
@@ -575,6 +573,7 @@ impl Node {
                     },
                 )
             })
+            .take(ALPHA)
             .collect::<BTreeMap<_, _>>();
         let mut lookup_round = 0_usize;
         loop {
@@ -582,8 +581,8 @@ impl Node {
             // TODO: mark queried nodes as such
             let picked_nodes = nearest_nodes
                 .iter_mut()
-                .take(ALPHA)
                 .filter_map(|(_, node)| if !node.queried { Some(node) } else { None })
+                .take(ALPHA)
                 .collect::<Vec<_>>();
 
             if picked_nodes.is_empty() {
