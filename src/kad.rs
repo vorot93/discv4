@@ -110,6 +110,10 @@ impl Table {
     #[instrument(skip(self, node), fields(node = &*node.id.to_string()))]
     pub fn add_verified(&mut self, node: NodeRecord) {
         trace!("Adding peer");
+        if node.address.is_ipv6() {
+            return;
+        }
+
         if let Some(bucket) = self.bucket_mut(node.id) {
             trace!("Adding to bucket: {:?}", bucket);
             if let Some(pos) = bucket.find_peer_pos(node.id) {
@@ -130,6 +134,10 @@ impl Table {
     #[instrument(skip(self, node), fields(node = &*node.id.to_string()))]
     pub fn add_seen(&mut self, node: NodeRecord) {
         trace!("Adding peer");
+        if node.address.is_ipv6() {
+            return;
+        }
+
         if let Some(bucket) = self.bucket_mut(node.id) {
             if bucket.find_peer_pos(node.id).is_some() {
                 // Peer exists already, do nothing

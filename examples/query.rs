@@ -1,9 +1,7 @@
-use std::{net::SocketAddr, time::Duration};
-
 use discv4::{Node, NodeRecord};
-use igd::aio::search_gateway;
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
+use std::time::Duration;
 use tokio::time::delay_for;
 use tracing::*;
 use tracing_subscriber::EnvFilter;
@@ -32,38 +30,16 @@ async fn main() {
 
     let port = 50505;
 
-    let external_ip = match async {
-        Ok::<_, anyhow::Error>(
-            search_gateway(Default::default())
-                .await?
-                .get_external_ip()
-                .await?,
-        )
-    }
-    .await
-    {
-        Ok(v) => {
-            info!("Discovered public IP: {}", v);
-            // gateway.add_port(PortMappingProtocol::UDP, 1234, ip, 120, "discv4-query").await
-            v
-        }
-        Err(e) => {
-            info!("Failed to get public IP: {}", e);
-            "0.0.0.0".parse().unwrap()
-        }
-    };
-
-    let addr = SocketAddr::new("0.0.0.0".parse().unwrap(), port);
-
     let node = Node::new(
-        addr,
+        format!("0.0.0.0:{}", port).parse().unwrap(),
         SigningKey::random(&mut OsRng),
         BOOTSTRAP_NODES
             .iter()
             .map(|v| NodeRecord::from_url(&Url::parse(v).unwrap()).unwrap())
             .collect(),
-        Some(external_ip.into()),
-        50505,
+        None,
+        true,
+        port,
     )
     .await
     .unwrap();
