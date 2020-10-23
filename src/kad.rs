@@ -149,18 +149,21 @@ impl Table {
     /// Remove node from the bucket
     #[instrument(skip(self, node), fields(node = &*node.to_string()))]
     pub fn remove(&mut self, node: NodeId) {
-        trace!("Removing from bucket");
         if let Some(bucket) = self.bucket_mut(node) {
             if bucket.replacements.is_empty() {
+                trace!("Not removing from bucket: no replacements");
                 return;
             }
 
             for i in 0..bucket.bucket.len() {
                 if bucket.bucket[i].id == node {
+                    let replacement = bucket
+                        .replacements
+                        .pop_front()
+                        .expect("already returned if no replacement");
+                    trace!("Replacing with {:?}", replacement);
                     bucket.bucket.remove(i);
-                    if let Some(node) = bucket.replacements.pop_front() {
-                        bucket.bucket.push_back(node);
-                    }
+                    bucket.bucket.push_back(replacement);
 
                     return;
                 }
