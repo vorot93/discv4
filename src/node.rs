@@ -517,7 +517,7 @@ impl Node {
                                                         remote_id,
                                                         EgressMessage::Neighbours(
                                                             NeighboursMessage {
-                                                                nodes,
+                                                                nodes: nodes.into_iter().collect(),
                                                                 expire: message.expire,
                                                             },
                                                         ),

@@ -1,4 +1,4 @@
-use crate::{kad::NodeBucket, NodeId, NodeRecord};
+use crate::{NodeId, NodeRecord};
 use arrayref::array_ref;
 use primitive_types::H256;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
@@ -107,7 +107,7 @@ pub struct FindNodeMessage {
 
 #[derive(Clone, Debug, RlpEncodable, RlpDecodable)]
 pub struct NeighboursMessage {
-    pub nodes: Box<NodeBucket>,
+    pub nodes: Vec<NodeRecord>,
     pub expire: u64,
 }
 
