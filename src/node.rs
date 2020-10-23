@@ -127,6 +127,7 @@ pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
 
+    id: NodeId,
     node_endpoint: Arc<RwLock<Endpoint>>,
 
     egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
@@ -477,6 +478,7 @@ impl Node {
         let this = Arc::new(Self {
             task_group,
             connected,
+            id,
             node_endpoint,
             egress_requests_tx,
             expected_pings,
@@ -489,7 +491,7 @@ impl Node {
                 while let Some(this) = this.upgrade() {
                     delay_for(REFRESH_TIMEOUT / 4).await;
 
-                    this.lookup(rand::random()).await;
+                    this.lookup(this.id).await;
                     drop(this);
 
                     delay_for(3 * REFRESH_TIMEOUT / 4).await;
