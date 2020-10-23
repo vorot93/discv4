@@ -145,6 +145,7 @@ impl InflightFindNode {
             let request_id = rand::random();
             if let hash_map::Entry::Vacant(entry) = node_data.entry(request_id) {
                 entry.insert(sender);
+                trace!("Inserted sender {}/{}", node_id, request_id);
                 return InflightFindNodeRequestGuard {
                     inner: self.inner.clone(),
                     node_id,
@@ -155,11 +156,11 @@ impl InflightFindNode {
     }
 
     fn get(&self, node_id: NodeId) -> Vec<Sender<NeighboursMessage>> {
-        self.inner
-            .lock()
-            .get(&node_id)
-            .map(|cbs| cbs.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_else(Vec::new)
+        if let Some(cbs) = self.inner.lock().get(&node_id) {
+            return cbs.values().cloned().collect();
+        }
+
+        vec![]
     }
 }
 
@@ -174,8 +175,13 @@ impl Drop for InflightFindNodeRequestGuard {
         let mut inner = self.inner.lock();
         let entry = inner.entry(self.node_id);
         if let hash_map::Entry::Occupied(mut entry) = entry {
+            trace!("Dropping entry {}/{}", self.node_id, self.request_id);
             assert!(entry.get_mut().remove(&self.request_id).is_some());
             if entry.get().is_empty() {
+                trace!(
+                    "No more data for node {}, dropping node entry",
+                    self.node_id
+                );
                 entry.remove();
             }
         } else {
@@ -432,115 +438,129 @@ impl Node {
                                 let typ = buf[97];
                                 let data = &buf[98..];
 
-                                match MessageId::from_u8(typ) {
-                                    Some(MessageId::Ping) => {
-                                        let ping_data = Rlp::new(data).as_val::<PingMessage>()?;
+                                async {
+                                    match MessageId::from_u8(typ) {
+                                        Some(MessageId::Ping) => {
+                                            let ping_data =
+                                                Rlp::new(data).as_val::<PingMessage>()?;
 
-                                        trace!("PING");
+                                            trace!("PING");
 
-                                        connected.lock().add_verified(NodeRecord {
-                                            address: ping_data.from.address,
-                                            udp_port: ping_data.from.udp_port,
-                                            tcp_port: ping_data.from.udp_port,
-                                            id: remote_id,
-                                        });
+                                            connected.lock().add_verified(NodeRecord {
+                                                address: ping_data.from.address,
+                                                udp_port: ping_data.from.udp_port,
+                                                tcp_port: ping_data.from.udp_port,
+                                                id: remote_id,
+                                            });
 
-                                        let _ = egress_requests_tx
-                                            .send((
-                                                addr,
-                                                remote_id,
-                                                EgressMessage::Pong(PongMessage {
-                                                    to: ping_data.from,
-                                                    echo: hash,
-                                                    expire: ping_data.expire,
-                                                }),
-                                            ))
-                                            .await;
-
-                                        if let Some(cbs) = expected_pings.lock().remove(&addr) {
-                                            for (_, cb) in cbs {
-                                                let _ = cb.send(());
-                                            }
-                                        }
-                                    }
-                                    Some(MessageId::Pong) => {
-                                        let message = Rlp::new(data).as_val::<PongMessage>()?;
-
-                                        // Did we actually ask for this? Ignore message if not.
-                                        if let Some(cbs) =
-                                            inflight_ping_requests.lock().remove(&message.echo)
-                                        {
-                                            trace!("PONG - our endpoint is: {:?}", message.to);
-                                            {
-                                                let mut node_endpoint = node_endpoint.write();
-                                                node_endpoint.address = message.to.address;
-                                                node_endpoint.udp_port = message.to.udp_port;
-                                            }
-                                            for cb in cbs {
-                                                let _ = cb.send(());
-                                            }
-                                        } else {
-                                            warn!("PONG (ignore)")
-                                        }
-                                    }
-                                    Some(MessageId::FindNode) => {
-                                        let message = Rlp::new(data).as_val::<FindNodeMessage>()?;
-
-                                        let mut neighbours = None;
-                                        {
-                                            let connected = connected.lock();
-
-                                            // Only send to nodes that have been proofed.
-                                            if connected.get(remote_id).is_some() {
-                                                trace!("FINDNODE");
-                                                neighbours =
-                                                    connected.neighbours(remote_id).map(Box::new);
-                                            } else {
-                                                warn!("FINDNODE (ignore)");
-                                            }
-                                        }
-
-                                        if let Some(nodes) = neighbours {
                                             let _ = egress_requests_tx
                                                 .send((
                                                     addr,
                                                     remote_id,
-                                                    EgressMessage::Neighbours(NeighboursMessage {
-                                                        nodes,
-                                                        expire: message.expire,
+                                                    EgressMessage::Pong(PongMessage {
+                                                        to: ping_data.from,
+                                                        echo: hash,
+                                                        expire: ping_data.expire,
                                                     }),
                                                 ))
                                                 .await;
+
+                                            if let Some(cbs) = expected_pings.lock().remove(&addr) {
+                                                for (_, cb) in cbs {
+                                                    let _ = cb.send(());
+                                                }
+                                            }
                                         }
-                                    }
-                                    Some(MessageId::Neighbours) => {
-                                        // Did we actually ask for this? Ignore message if not.
-                                        let cbs = inflight_find_node_requests.get(remote_id);
-                                        if cbs.is_empty() {
-                                            trace!("NEIGHBOURS (ignore)");
-                                        } else {
-                                            trace!("NEIGHBOURS");
+                                        Some(MessageId::Pong) => {
+                                            let message = Rlp::new(data).as_val::<PongMessage>()?;
 
-                                            // OK, so we did ask, let's handle the message.
-                                            let message =
-                                                Rlp::new(data).as_val::<NeighboursMessage>()?;
+                                            // Did we actually ask for this? Ignore message if not.
+                                            if let Some(cbs) =
+                                                inflight_ping_requests.lock().remove(&message.echo)
                                             {
-                                                let mut connected = connected.lock();
+                                                trace!("PONG - our endpoint is: {:?}", message.to);
+                                                {
+                                                    let mut node_endpoint = node_endpoint.write();
+                                                    node_endpoint.address = message.to.address;
+                                                    node_endpoint.udp_port = message.to.udp_port;
+                                                }
+                                                for cb in cbs {
+                                                    let _ = cb.send(());
+                                                }
+                                            } else {
+                                                warn!("PONG (ignore)")
+                                            }
+                                        }
+                                        Some(MessageId::FindNode) => {
+                                            let message =
+                                                Rlp::new(data).as_val::<FindNodeMessage>()?;
 
-                                                for peer in message.nodes.iter() {
-                                                    connected.add_seen(*peer);
+                                            let mut neighbours = None;
+                                            {
+                                                let connected = connected.lock();
+
+                                                // Only send to nodes that have been proofed.
+                                                if connected.get(remote_id).is_some() {
+                                                    trace!("FINDNODE");
+                                                    neighbours = connected
+                                                        .neighbours(remote_id)
+                                                        .map(Box::new);
+                                                } else {
+                                                    warn!("FINDNODE (ignore)");
                                                 }
                                             }
 
-                                            for mut cb in cbs {
-                                                let _ = cb.send(message.clone()).await;
+                                            if let Some(nodes) = neighbours {
+                                                let _ = egress_requests_tx
+                                                    .send((
+                                                        addr,
+                                                        remote_id,
+                                                        EgressMessage::Neighbours(
+                                                            NeighboursMessage {
+                                                                nodes,
+                                                                expire: message.expire,
+                                                            },
+                                                        ),
+                                                    ))
+                                                    .await;
                                             }
                                         }
-                                    }
-                                    None => bail!("Invalid message type: {}", typ),
-                                };
+                                        Some(MessageId::Neighbours) => {
+                                            // Did we actually ask for this? Ignore message if not.
+                                            let cbs = inflight_find_node_requests.get(remote_id);
+                                            if cbs.is_empty() {
+                                                trace!("NEIGHBOURS (ignore)");
+                                            } else {
+                                                trace!("NEIGHBOURS");
 
-                                Ok(())
+                                                // OK, so we did ask, let's handle the message.
+                                                let message =
+                                                    Rlp::new(data).as_val::<NeighboursMessage>()?;
+                                                {
+                                                    let mut connected = connected.lock();
+
+                                                    for peer in message.nodes.iter() {
+                                                        connected.add_seen(*peer);
+                                                    }
+                                                }
+
+                                                for mut cb in cbs {
+                                                    let _ = cb.send(message.clone()).await;
+                                                }
+                                            }
+                                        }
+                                        None => bail!("Invalid message type: {}", typ),
+                                    };
+
+                                    Ok(())
+                                }
+                                .instrument(span!(
+                                    Level::TRACE,
+                                    "HANDLER",
+                                    "remote_id={}",
+                                    &*remote_id.to_string()
+                                ))
+                                .await
                             }
                             .instrument(span!(Level::TRACE, "IN", "addr={}", &*addr.to_string()))
                             .await
@@ -631,6 +651,7 @@ impl Node {
         struct QueryNode {
             record: NodeRecord,
             queried: bool,
+            responded: bool,
         }
 
         let node_endpoint = *self.node_endpoint.read();
@@ -648,6 +669,7 @@ impl Node {
                     QueryNode {
                         record,
                         queried: false,
+                        responded: false,
                     },
                 )
             })
@@ -656,10 +678,15 @@ impl Node {
         let mut lookup_round = 0_usize;
         loop {
             // For each node of ALPHA closest and not queried yet...
-            // TODO: mark queried nodes as such
             let picked_nodes = nearest_nodes
                 .iter_mut()
-                .filter_map(|(_, node)| if !node.queried { Some(node) } else { None })
+                .filter_map(|(distance, node)| {
+                    if !node.queried {
+                        Some((*distance, node))
+                    } else {
+                        None
+                    }
+                })
                 .take(ALPHA)
                 .collect::<Vec<_>>();
 
@@ -668,7 +695,7 @@ impl Node {
                 break;
             }
 
-            let fut = picked_nodes.into_iter().map(|node| {
+            let fut = picked_nodes.into_iter().map(|(distance, node)| {
                 // ...send find node request...
                 node.queried = true;
                 let node = *node;
@@ -763,7 +790,7 @@ impl Node {
 
                     match res {
                         Ok(Ok(v)) => {
-                            return Some(v);
+                            return Some((distance, v));
                         }
                         Ok(Err(e)) => {
                             debug!("Query error: {}", e);
@@ -785,7 +812,11 @@ impl Node {
             });
 
             for message in join_all(fut).await {
-                if let Some(messages) = message {
+                if let Some((d, messages)) = message {
+                    nearest_nodes
+                        .get_mut(&d)
+                        .expect("we just got this node from the nearest node set")
+                        .responded = true;
                     for message in messages {
                         // If we have a node...
                         for record in message.nodes.into_iter() {
@@ -797,6 +828,7 @@ impl Node {
                                 vacant.insert(QueryNode {
                                     record,
                                     queried: false,
+                                    responded: false,
                                 });
                             }
                         }
@@ -809,7 +841,13 @@ impl Node {
 
         nearest_nodes
             .into_iter()
-            .map(|(_, node)| node.record)
+            .filter_map(|(_, node)| {
+                if node.responded {
+                    Some(node.record)
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
