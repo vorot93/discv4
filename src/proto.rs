@@ -1,6 +1,6 @@
 use crate::message::*;
 use enum_primitive_derive::Primitive;
-use tokio::sync::{mpsc::Sender, oneshot::Sender as OneshotSender};
+use tokio::sync::oneshot::Sender as OneshotSender;
 
 #[derive(Primitive)]
 pub enum MessageId {
@@ -14,6 +14,6 @@ pub enum MessageId {
 pub enum EgressMessage {
     Ping(PingMessage, Option<OneshotSender<()>>),
     Pong(PongMessage),
-    FindNode(FindNodeMessage, u64, Sender<NeighboursMessage>),
+    FindNode(FindNodeMessage),
     Neighbours(NeighboursMessage),
 }

@@ -123,6 +123,64 @@ impl NodeRecord {
     }
 }
 
+type InflightFindNodeInner = HashMap<NodeId, HashMap<RequestId, Sender<NeighboursMessage>>>;
+
+#[derive(Default)]
+struct InflightFindNode {
+    inner: Arc<Mutex<InflightFindNodeInner>>,
+}
+
+impl InflightFindNode {
+    fn add(
+        &self,
+        node_id: NodeId,
+        sender: Sender<NeighboursMessage>,
+    ) -> InflightFindNodeRequestGuard {
+        loop {
+            let mut inner = self.inner.lock();
+            let node_data = inner.entry(node_id).or_default();
+            let request_id = rand::random();
+            if let hash_map::Entry::Vacant(entry) = node_data.entry(request_id) {
+                entry.insert(sender);
+                return InflightFindNodeRequestGuard {
+                    inner: self.inner.clone(),
+                    node_id,
+                    request_id,
+                };
+            }
+        }
+    }
+
+    fn get(&self, node_id: NodeId) -> Vec<Sender<NeighboursMessage>> {
+        self.inner
+            .lock()
+            .get(&node_id)
+            .map(|cbs| cbs.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_else(Vec::new)
+    }
+}
+
+struct InflightFindNodeRequestGuard {
+    inner: Arc<Mutex<InflightFindNodeInner>>,
+    node_id: NodeId,
+    request_id: RequestId,
+}
+
+impl Drop for InflightFindNodeRequestGuard {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        let entry = inner.entry(self.node_id);
+        if let hash_map::Entry::Occupied(mut entry) = entry {
+            assert!(entry.get_mut().remove(&self.request_id).is_some());
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        } else {
+            unreachable!("not anyone else's business to drop data")
+        }
+    }
+}
+
 pub struct Node {
     task_group: Arc<TaskGroup>,
     connected: Arc<Mutex<Table>>,
@@ -132,13 +190,11 @@ pub struct Node {
 
     egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
     expected_pings: Arc<Mutex<HashMap<SocketAddr, HashMap<RequestId, OneshotSender<()>>>>>,
-    inflight_find_node_requests:
-        Arc<Mutex<HashMap<NodeId, HashMap<RequestId, Sender<NeighboursMessage>>>>>,
+    inflight_find_node_requests: Arc<InflightFindNode>,
 }
 
 enum PreTrigger {
     Ping(Option<OneshotSender<()>>),
-    FindNode(u64, Sender<NeighboursMessage>),
 }
 
 enum PostSendTrigger {
@@ -179,10 +235,7 @@ impl Node {
 
         let connected = Arc::new(Mutex::new(table));
 
-        let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
-            NodeId,
-            HashMap<RequestId, Sender<NeighboursMessage>>,
-        >::default()));
+        let inflight_find_node_requests = Arc::new(InflightFindNode::default());
         let inflight_ping_requests = Arc::new(Mutex::new(H256Map::<Vec<_>>::default()));
         let expected_pings = Arc::new(Mutex::new(HashMap::<
             SocketAddr,
@@ -192,7 +245,6 @@ impl Node {
         task_group.spawn_with_name("discv4 egress router", {
             let task_group = Arc::downgrade(&task_group);
             let connected = connected.clone();
-            let inflight_find_node_requests = inflight_find_node_requests.clone();
             let inflight_ping_requests = inflight_ping_requests.clone();
             async move {
                 while let Some((addr, peer, message)) = egress_requests.next().await {
@@ -214,8 +266,7 @@ impl Node {
                             EgressMessage::Pong(message) => {
                                 once(2).chain(rlp::encode(&message)).collect()
                             }
-                            EgressMessage::FindNode(message, id, sender) => {
-                                pre_trigger = Some(PreTrigger::FindNode(id, sender));
+                            EgressMessage::FindNode(message) => {
                                 once(3).chain(rlp::encode(&message)).collect()
                             }
                             EgressMessage::Neighbours(message) => {
@@ -246,15 +297,6 @@ impl Node {
                                 if let Some(sender) = sender {
                                     cbs.push(sender);
                                 }
-                            }
-                            Some(PreTrigger::FindNode(id, sender)) => {
-                                assert!(inflight_find_node_requests
-                                    .lock()
-                                    .entry(peer)
-                                    .or_default()
-                                    .insert(id, sender)
-                                    .is_none());
-                                do_send = true;
                             }
                             None => {
                                 do_send = true;
@@ -434,11 +476,10 @@ impl Node {
                                     }
                                     Some(MessageId::Neighbours) => {
                                         // Did we actually ask for this? Ignore message if not.
-                                        let cbs = inflight_find_node_requests
-                                            .lock()
-                                            .get(&remote_id)
-                                            .map(|cbs| cbs.values().cloned().collect::<Vec<_>>());
-                                        if let Some(cbs) = cbs {
+                                        let cbs = inflight_find_node_requests.get(remote_id);
+                                        if cbs.is_empty() {
+                                            trace!("NEIGHBOURS (ignore)");
+                                        } else {
                                             trace!("NEIGHBOURS");
 
                                             // OK, so we did ask, let's handle the message.
@@ -455,8 +496,6 @@ impl Node {
                                             for mut cb in cbs {
                                                 let _ = cb.send(message.clone()).await;
                                             }
-                                        } else {
-                                            trace!("NEIGHBOURS (ignore)")
                                         }
                                     }
                                     None => bail!("Invalid message type: {}", typ),
@@ -634,10 +673,8 @@ impl Node {
                         // In case the node wants to ping us, give it an opportunity to do so
                         let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
 
-                        // TODO: insert into inflight_find_node_requests here
-                        // TODO: guarantee execution even if through lookup future drop (otherwise dangling find node request possible)
-                        let find_node_id = rand::random();
                         let (tx, mut rx) = channel(1);
+                        let _guard = inflight_find_node_requests.add(node.record.id, tx);
                         egress_requests_tx
                             .send((
                                 addr,
@@ -647,8 +684,6 @@ impl Node {
                                         id: target,
                                         expire: find_node_expiry(),
                                     },
-                                    find_node_id,
-                                    tx,
                                 ),
                             ))
                             .await
@@ -666,16 +701,6 @@ impl Node {
                                 }
                                 _ = timeout => {
                                     break;
-                                }
-                            }
-                        }
-                        {
-                            let mut inflight_find_node_requests = inflight_find_node_requests.lock();
-                            let entry = inflight_find_node_requests.entry(node.record.id);
-                            if let hash_map::Entry::Occupied(mut entry) = entry {
-                                entry.get_mut().remove(&find_node_id);
-                                if entry.get().is_empty() {
-                                    entry.remove();
                                 }
                             }
                         }
