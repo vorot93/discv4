@@ -27,6 +27,7 @@ use task_group::TaskGroup;
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
+    select,
     stream::StreamExt,
     sync::{
         mpsc::{channel, Sender},
@@ -130,16 +131,17 @@ pub struct Node {
 
     egress_requests_tx: Sender<(SocketAddr, NodeId, EgressMessage)>,
     expected_pings: Arc<Mutex<HashMap<SocketAddr, HashMap<RequestId, OneshotSender<()>>>>>,
+    inflight_find_node_requests:
+        Arc<Mutex<HashMap<NodeId, HashMap<RequestId, Sender<NeighboursMessage>>>>>,
 }
 
 enum PreTrigger {
     Ping(Option<OneshotSender<()>>),
-    FindNode(Option<OneshotSender<NeighboursMessage>>),
+    FindNode(u64, Sender<NeighboursMessage>),
 }
 
 enum PostSendTrigger {
     Ping,
-    FindNode,
 }
 
 impl Node {
@@ -178,7 +180,7 @@ impl Node {
 
         let inflight_find_node_requests = Arc::new(Mutex::new(HashMap::<
             NodeId,
-            Option<OneshotSender<NeighboursMessage>>,
+            HashMap<RequestId, Sender<NeighboursMessage>>,
         >::default()));
         let inflight_ping_requests = Arc::new(Mutex::new(H256Map::<Vec<_>>::default()));
         let expected_pings = Arc::new(Mutex::new(HashMap::<
@@ -211,9 +213,8 @@ impl Node {
                             EgressMessage::Pong(message) => {
                                 once(2).chain(rlp::encode(&message)).collect()
                             }
-                            EgressMessage::FindNode(message, sender) => {
-                                pre_trigger = Some(PreTrigger::FindNode(sender));
-                                post_trigger = Some(PostSendTrigger::FindNode);
+                            EgressMessage::FindNode(message, id, sender) => {
+                                pre_trigger = Some(PreTrigger::FindNode(id, sender));
                                 once(3).chain(rlp::encode(&message)).collect()
                             }
                             EgressMessage::Neighbours(message) => {
@@ -245,8 +246,13 @@ impl Node {
                                     cbs.push(sender);
                                 }
                             }
-                            Some(PreTrigger::FindNode(sender)) => {
-                                inflight_find_node_requests.lock().insert(peer, sender);
+                            Some(PreTrigger::FindNode(id, sender)) => {
+                                assert!(inflight_find_node_requests
+                                    .lock()
+                                    .entry(peer)
+                                    .or_default()
+                                    .insert(id, sender)
+                                    .is_none());
                                 do_send = true;
                             }
                             None => {
@@ -281,19 +287,6 @@ impl Node {
                                         });
                                     }
                                 }
-                                PostSendTrigger::FindNode => {
-                                    if let Some(task_group) = task_group.upgrade() {
-                                        // TODO: move to timeout tracker
-                                        task_group.spawn({
-                                            let inflight_find_node_requests =
-                                                inflight_find_node_requests.clone();
-                                            async move {
-                                                delay_for(FIND_NODE_TIMEOUT).await;
-                                                inflight_find_node_requests.lock().remove(&peer);
-                                            }
-                                        });
-                                    }
-                                }
                             }
                         }
                     }
@@ -314,6 +307,7 @@ impl Node {
             let connected = connected.clone();
             let node_endpoint = node_endpoint.clone();
             let expected_pings = expected_pings.clone();
+            let inflight_find_node_requests = inflight_find_node_requests.clone();
             async move {
                 while let Some(res) = udp_rx.next().await {
                     match res {
@@ -439,23 +433,26 @@ impl Node {
                                     }
                                     Some(MessageId::Neighbours) => {
                                         // Did we actually ask for this? Ignore message if not.
-                                        if let Some(cb) =
-                                            inflight_find_node_requests.lock().remove(&remote_id)
-                                        {
+                                        let cbs = inflight_find_node_requests
+                                            .lock()
+                                            .get(&remote_id)
+                                            .map(|cbs| cbs.values().cloned().collect::<Vec<_>>());
+                                        if let Some(cbs) = cbs {
                                             trace!("NEIGHBOURS");
 
                                             // OK, so we did ask, let's handle the message.
                                             let message =
                                                 Rlp::new(data).as_val::<NeighboursMessage>()?;
+                                            {
+                                                let mut connected = connected.lock();
 
-                                            let mut connected = connected.lock();
-
-                                            for peer in message.nodes.iter() {
-                                                connected.add_seen(*peer);
+                                                for peer in message.nodes.iter() {
+                                                    connected.add_seen(*peer);
+                                                }
                                             }
 
-                                            if let Some(cb) = cb {
-                                                let _ = cb.send(message);
+                                            for mut cb in cbs {
+                                                let _ = cb.send(message.clone()).await;
                                             }
                                         } else {
                                             trace!("NEIGHBOURS (ignore)")
@@ -483,6 +480,7 @@ impl Node {
             node_endpoint,
             egress_requests_tx,
             expected_pings,
+            inflight_find_node_requests,
         });
 
         this.task_group.spawn_with_name("discv4 refresher", {
@@ -579,6 +577,7 @@ impl Node {
         let mut lookup_round = 0_usize;
         loop {
             // For each node of ALPHA closest and not queried yet...
+            // TODO: mark queried nodes as such
             let picked_nodes = nearest_nodes
                 .iter_mut()
                 .take(ALPHA)
@@ -596,6 +595,7 @@ impl Node {
                 let node = *node;
                 let mut egress_requests_tx = egress_requests_tx.clone();
                 let expected_pings = self.expected_pings.clone();
+                let inflight_find_node_requests = self.inflight_find_node_requests.clone();
                 let expected_ping_id = rand::random();
                 async move {
                     let addr = SocketAddr::new(node.record.address, node.record.udp_port);
@@ -633,7 +633,10 @@ impl Node {
                         // In case the node wants to ping us, give it an opportunity to do so
                         let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
 
-                        let (tx, rx) = oneshot();
+                        // TODO: insert into inflight_find_node_requests here
+                        // TODO: guarantee execution even if through lookup future drop (otherwise dangling find node request possible)
+                        let find_node_id = rand::random();
+                        let (tx, mut rx) = channel(1);
                         egress_requests_tx
                             .send((
                                 addr,
@@ -643,7 +646,8 @@ impl Node {
                                         id: target,
                                         expire: find_node_expiry(),
                                     },
-                                    Some(tx),
+                                    find_node_id,
+                                    tx,
                                 ),
                             ))
                             .await
@@ -652,11 +656,35 @@ impl Node {
                         debug!("Awaiting neighbours");
 
                         // ...and await for Neighbours response
-                        let neighbours = rx.await.map_err(|_| anyhow!("Neighbours timeout"))?;
+                        let mut received_neighbours = Vec::new();
+                        loop {
+                            let timeout = delay_for(Duration::from_secs(2));
+                            select! {
+                                neighbours = rx.recv() => {
+                                    received_neighbours.push(neighbours.expect("we drop the sending channel, not the ingress router"));
+                                }
+                                _ = timeout => {
+                                    break;
+                                }
+                            }
+                        }
+                        {
+                            let mut inflight_find_node_requests = inflight_find_node_requests.lock();
+                            let entry = inflight_find_node_requests.entry(node.record.id);
+                            if let hash_map::Entry::Occupied(mut entry) = entry {
+                                entry.get_mut().remove(&find_node_id);
+                                if entry.get().is_empty() {
+                                    entry.remove();
+                                }
+                            }
+                        }
+                        if received_neighbours.is_empty() {
+                            bail!("No neigbours received");
+                        }
 
                         debug!("Received neighbours");
 
-                        Ok::<_, anyhow::Error>(neighbours)
+                        Ok::<_, anyhow::Error>(received_neighbours)
                     })
                     .await;
 
@@ -692,18 +720,20 @@ impl Node {
             });
 
             for message in join_all(fut).await {
-                if let Some(message) = message {
-                    // If we have a node...
-                    for record in message.nodes.into_iter() {
-                        // ...and it's not been seen yet...
-                        if let btree_map::Entry::Vacant(vacant) =
-                            nearest_nodes.entry(distance(target, record.id))
-                        {
-                            // ...add to the set and continue the query
-                            vacant.insert(QueryNode {
-                                record,
-                                queried: false,
-                            });
+                if let Some(messages) = message {
+                    for message in messages {
+                        // If we have a node...
+                        for record in message.nodes.into_iter() {
+                            // ...and it's not been seen yet...
+                            if let btree_map::Entry::Vacant(vacant) =
+                                nearest_nodes.entry(distance(target, record.id))
+                            {
+                                // ...add to the set and continue the query
+                                vacant.insert(QueryNode {
+                                    record,
+                                    queried: false,
+                                });
+                            }
                         }
                     }
                 }
