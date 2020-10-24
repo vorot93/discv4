@@ -94,8 +94,14 @@ impl NodeRecord {
     pub fn udp_addr(&self) -> SocketAddr {
         SocketAddr::new(self.address, self.udp_port)
     }
+}
 
-    pub fn from_url(url: &Url) -> Result<Self, NodeRecordParseError> {
+impl FromStr for NodeRecord {
+    type Err = NodeRecordParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let url = Url::parse(s).map_err(|e| NodeRecordParseError::InvalidUrl(e.into()))?;
+
         let address = match url.host() {
             Some(Host::Ipv4(ip)) => IpAddr::V4(ip),
             Some(Host::Ipv6(ip)) => IpAddr::V6(ip),

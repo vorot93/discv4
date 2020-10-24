@@ -1,11 +1,10 @@
-use discv4::{Node, NodeRecord};
+use discv4::Node;
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use std::time::Duration;
 use tokio::time::delay_for;
 use tracing::*;
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
 const BOOTSTRAP_NODES: &[&str] = &[
     "enode://d860a01f9722d78051619d1e2351aba3f43f943f6f00718d1b9baa4101932a1f5011f16bb2b1bb35db20d6fe28fa0bf09636d26a87d31de9ec6203eeedb1f666@18.138.108.67:30303",
@@ -33,10 +32,7 @@ async fn main() {
     let node = Node::new(
         format!("0.0.0.0:{}", port).parse().unwrap(),
         SigningKey::random(&mut OsRng),
-        BOOTSTRAP_NODES
-            .iter()
-            .map(|v| NodeRecord::from_url(&Url::parse(v).unwrap()).unwrap())
-            .collect(),
+        BOOTSTRAP_NODES.iter().map(|v| v.parse().unwrap()).collect(),
         None,
         true,
         port,
