@@ -2,7 +2,7 @@ use discv4::Node;
 use k256::ecdsa::SigningKey;
 use rand::rngs::OsRng;
 use std::time::Duration;
-use tokio::time::delay_for;
+use tokio::time::sleep;
 use tracing::*;
 use tracing_subscriber::EnvFilter;
 
@@ -46,7 +46,7 @@ async fn main() {
             loop {
                 info!("Current nodes: {}", node.num_nodes());
 
-                delay_for(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(5)).await;
             }
         }
     });
@@ -60,6 +60,6 @@ async fn main() {
             info!("Found node: {:?}", entry);
         }
 
-        delay_for(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(5)).await;
     }
 }

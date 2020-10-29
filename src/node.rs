@@ -33,9 +33,9 @@ use tokio::{
         mpsc::{channel, Sender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
     },
-    time::{delay_for, timeout},
+    time::{sleep, timeout},
 };
-use tokio_util::{codec::BytesCodec, udp::UdpFramed};
+use tokio_compat_02::FutureExt;
 use tracing::*;
 use url::{Host, Url};
 
@@ -246,6 +246,7 @@ impl Node {
                                     .await?,
                             )
                         }
+                        .compat()
                         .await
                         {
                             Ok(v) => {
@@ -256,7 +257,7 @@ impl Node {
                                 debug!("Failed to get public IP: {}", e);
                             }
                         }
-                        delay_for(UPNP_INTERVAL).await;
+                        sleep(UPNP_INTERVAL).await;
                     }
                 }
                 .instrument(span!(Level::TRACE, "UPNP",))
@@ -267,10 +268,7 @@ impl Node {
 
         debug!("Starting node with id: {}", id);
 
-        let (mut udp_tx, mut udp_rx) = futures::stream::StreamExt::split(UdpFramed::new(
-            UdpSocket::bind(&addr).await?,
-            BytesCodec::new(),
-        ));
+        let udp = Arc::new(UdpSocket::bind(&addr).await?);
 
         let (egress_requests_tx, mut egress_requests) = channel(1);
 
@@ -293,6 +291,7 @@ impl Node {
             let task_group = Arc::downgrade(&task_group);
             let connected = connected.clone();
             let inflight_ping_requests = inflight_ping_requests.clone();
+            let udp = udp.clone();
             async move {
                 while let Some((addr, peer, message)) = egress_requests.next().await {
                     async {
@@ -354,7 +353,7 @@ impl Node {
                             return;
                         }
 
-                        if let Err(e) = udp_tx.send((datagram.clone().into(), addr)).await {
+                        if let Err(e) = udp.send_to(&datagram, addr).await {
                             warn!("UDP socket send failure: {}", e);
                             return;
                         } else if let Some(trigger) = post_trigger {
@@ -366,7 +365,7 @@ impl Node {
                                             let inflight_ping_requests =
                                                 inflight_ping_requests.clone();
                                             async move {
-                                                delay_for(PING_TIMEOUT).await;
+                                                sleep(PING_TIMEOUT).await;
                                                 let mut connected = connected.lock();
                                                 let mut inflight_ping_requests =
                                                     inflight_ping_requests.lock();
@@ -393,19 +392,22 @@ impl Node {
         });
 
         task_group.spawn_with_name("discv4 ingress router", {
-            let mut egress_requests_tx = egress_requests_tx.clone();
+            let egress_requests_tx = egress_requests_tx.clone();
             let connected = connected.clone();
             let node_endpoint = node_endpoint.clone();
             let expected_pings = expected_pings.clone();
             let inflight_find_node_requests = inflight_find_node_requests.clone();
             async move {
-                while let Some(res) = udp_rx.next().await {
+                loop {
+                    let mut buf = [0; MAX_PACKET_SIZE];
+                    let res = udp.recv_from(&mut buf).await;
                     match res {
                         Err(e) => {
                             warn!("UDP socket recv failure: {}", e);
                             break;
                         }
-                        Ok((buf, addr)) => {
+                        Ok((len, addr)) => {
+                            let buf = &buf[..len];
                             if let Err(e) = async {
                                 if addr.is_ipv6() {
                                     bail!("IPv6 is unsupported");
@@ -550,7 +552,7 @@ impl Node {
                                                     }
                                                 }
 
-                                                for mut cb in cbs {
+                                                for cb in cbs {
                                                     let _ = cb.send(message.clone()).await;
                                                 }
                                             }
@@ -596,7 +598,7 @@ impl Node {
                     this.lookup_self().await;
                     drop(this);
 
-                    delay_for(REFRESH_TIMEOUT).await;
+                    sleep(REFRESH_TIMEOUT).await;
                 }
             }
         });
@@ -606,7 +608,7 @@ impl Node {
                 format!("discv4 oldest node pinger - bucket #{}", bucket_no),
                 {
                     let connected = this.connected.clone();
-                    let mut egress_requests_tx = this.egress_requests_tx.clone();
+                    let egress_requests_tx = this.egress_requests_tx.clone();
                     let node_endpoint = this.node_endpoint.clone();
                     async move {
                         loop {
@@ -637,7 +639,7 @@ impl Node {
                                 let _ = rx.await;
                             }
 
-                            delay_for(Duration::from_secs_f32(
+                            sleep(Duration::from_secs_f32(
                                 BUCKET_REFRESH_INTERVAL.as_secs_f32()
                                     * OsRng.sample::<f32, _>(Standard),
                             ))
@@ -714,7 +716,7 @@ impl Node {
                 // ...send find node request...
                 node.queried = true;
                 let node = *node;
-                let mut egress_requests_tx = egress_requests_tx.clone();
+                let egress_requests_tx = egress_requests_tx.clone();
                 let expected_pings = self.expected_pings.clone();
                 let inflight_find_node_requests = self.inflight_find_node_requests.clone();
                 let expected_ping_id = rand::random();
