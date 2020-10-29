@@ -2,7 +2,7 @@ use crate::{kad::*, message::*, proto::*, util::*, NodeId};
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
-use futures::{future::join_all, SinkExt};
+use futures_util::future::join_all;
 use igd::aio::search_gateway;
 use k256::ecdsa::{
     recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
