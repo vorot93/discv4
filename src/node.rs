@@ -12,7 +12,7 @@ use k256::ecdsa::{
 use num_traits::FromPrimitive;
 use parking_lot::{Mutex, RwLock};
 use primitive_types::H256;
-use rand::{distributions::Standard, rngs::OsRng, Rng};
+use rand::{distributions::Standard, prelude::SliceRandom, thread_rng, Rng};
 use rlp::Rlp;
 use sha3::{Digest, Keccak256};
 use std::{
@@ -46,7 +46,7 @@ pub const MAX_PACKET_SIZE: usize = 1280;
 pub const UPNP_INTERVAL: Duration = Duration::from_secs(60);
 pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
-pub const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+pub const PING_INTERVAL: Duration = Duration::from_secs(10);
 pub const FIND_NODE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const QUERY_AWAIT_PING_TIME: Duration = Duration::from_secs(2);
 pub const NEIGHBOURS_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -603,52 +603,54 @@ impl Node {
             }
         });
 
-        for bucket_no in 0..ADDRESS_BITS {
-            this.task_group.spawn_with_name(
-                format!("discv4 oldest node pinger - bucket #{}", bucket_no),
-                {
-                    let connected = this.connected.clone();
-                    let egress_requests_tx = this.egress_requests_tx.clone();
-                    let node_endpoint = this.node_endpoint.clone();
-                    async move {
-                        loop {
-                            let oldest = connected.lock().oldest(bucket_no as u8);
+        this.task_group
+            .spawn_with_name("discv4 oldest node pinger", {
+                let connected = this.connected.clone();
+                let egress_requests_tx = this.egress_requests_tx.clone();
+                let node_endpoint = this.node_endpoint.clone();
+                async move {
+                    loop {
+                        let oldest = {
+                            let connected = connected.lock();
+                            connected
+                                .filled_buckets()
+                                .choose(&mut thread_rng())
+                                .and_then(|bucket_no| connected.oldest(*bucket_no))
+                        };
 
+                        if let Some(node) = oldest {
                             let (tx, rx) = oneshot();
-                            if let Some(node) = oldest {
-                                let from = *node_endpoint.read();
-                                if egress_requests_tx
-                                    .send((
-                                        node.udp_addr(),
-                                        id,
-                                        EgressMessage::Ping(
-                                            PingMessage {
-                                                from,
-                                                to: node.into(),
-                                                expire: ping_expiry(),
-                                            },
-                                            Some(tx),
-                                        ),
-                                    ))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-
-                                let _ = rx.await;
+                            let from = *node_endpoint.read();
+                            if egress_requests_tx
+                                .send((
+                                    node.udp_addr(),
+                                    id,
+                                    EgressMessage::Ping(
+                                        PingMessage {
+                                            from,
+                                            to: node.into(),
+                                            expire: ping_expiry(),
+                                        },
+                                        Some(tx),
+                                    ),
+                                ))
+                                .await
+                                .is_err()
+                            {
+                                return;
                             }
 
-                            sleep(Duration::from_secs_f32(
-                                BUCKET_REFRESH_INTERVAL.as_secs_f32()
-                                    * OsRng.sample::<f32, _>(Standard),
-                            ))
-                            .await;
+                            let _ = rx.await;
                         }
+
+                        let sleep_duration = Duration::from_secs_f32(
+                            PING_INTERVAL.as_secs_f32() * thread_rng().sample::<f32, _>(Standard),
+                        );
+
+                        sleep(sleep_duration).await;
                     }
-                },
-            );
-        }
+                }
+            });
 
         Ok(this)
     }

@@ -2,7 +2,10 @@ use crate::{message::*, util::*, NodeId, NodeRecord};
 use array_init::array_init;
 use arrayvec::ArrayVec;
 use primitive_types::H256;
-use std::collections::{BTreeMap, VecDeque};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    convert::TryFrom,
+};
 use tracing::*;
 
 pub const BUCKET_SIZE: usize = 16;
@@ -94,6 +97,20 @@ impl Table {
         }
 
         None
+    }
+
+    pub fn filled_buckets(&self) -> Vec<u8> {
+        self.kbuckets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, kbucket)| {
+                if kbucket.bucket.len() >= BUCKET_SIZE {
+                    Some(u8::try_from(i).expect("there are only 255 kbuckets"))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn oldest(&self, bucket_no: u8) -> Option<NodeRecord> {
