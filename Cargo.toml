@@ -22,7 +22,6 @@ fixed-hash = { version = "*", features = ["std"] }
 futures-util = "0.3"
 hex = "0.4.2"
 igd = { version = "0.11", features = ["aio"] }
-k256 = { version = "0.5", default-features = false, features = ["ecdsa"] }
 num-traits = "0.2.12"
 parking_lot = "0.11"
 plain_hasher = "0.2.3"
@@ -30,8 +29,8 @@ primitive-types = { version = "0.7", default-features = false, features = ["rlp"
 rand = "0.7"
 rlp = "0.4"
 rlp-derive = "0.1"
+secp256k1 = { version = "0.19", features = ["global-context", "rand-std", "recovery"] }
 sha3 = "0.9"
-signature = { version = "1", features = ["std"] }
 task-group = { git = "https://github.com/vorot93/task-group" }
 thiserror = "1"
 tokio = { version = "0.3", features = ["net", "rt", "sync", "time"] }
@@ -41,5 +40,6 @@ tracing-futures = "0.2"
 url = "2"
 
 [dev-dependencies]
+secp256k1 = "0.19"
 tokio = { version = "0.3", features = ["full"] }
 tracing-subscriber = "0.2"

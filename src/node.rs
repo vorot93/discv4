@@ -4,21 +4,20 @@ use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
 use futures_util::future::join_all;
 use igd::aio::search_gateway;
-use k256::ecdsa::{
-    recoverable::{Id as RecoveryId, Signature as RecoverableSignature},
-    signature::{DigestSigner, Signature as _},
-    Signature, SigningKey,
-};
 use num_traits::FromPrimitive;
 use parking_lot::{Mutex, RwLock};
 use primitive_types::H256;
 use rand::{distributions::Standard, prelude::SliceRandom, thread_rng, Rng};
 use rlp::Rlp;
+use secp256k1::{
+    recovery::{RecoverableSignature, RecoveryId},
+    Message, PublicKey, SecretKey, SECP256K1,
+};
 use sha3::{Digest, Keccak256};
 use std::{
     collections::{btree_map, hash_map, BTreeMap, HashMap},
     convert::TryFrom,
-    iter::once,
+    iter::{empty, once},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
@@ -219,7 +218,7 @@ enum PostSendTrigger {
 impl Node {
     pub async fn new(
         addr: SocketAddrV4,
-        secret_key: SigningKey,
+        secret_key: SecretKey,
         bootstrap_nodes: Vec<NodeRecord>,
         public_address: Option<Ipv4Addr>,
         enable_upnp: bool,
@@ -264,7 +263,7 @@ impl Node {
             });
         }
 
-        let id = pk2id(&secret_key.verify_key());
+        let id = pk2id(&PublicKey::from_secret_key(&SECP256K1, &secret_key));
 
         debug!("Starting node with id: {}", id);
 
@@ -303,7 +302,7 @@ impl Node {
 
                         let mut pre_trigger = None;
                         let mut post_trigger = None;
-                        let mut typdata = match message {
+                        let typdata: Vec<u8> = match message {
                             EgressMessage::Ping(message, sender) => {
                                 pre_trigger = Some(PreTrigger::Ping(sender));
                                 post_trigger = Some(PostSendTrigger::Ping);
@@ -320,11 +319,19 @@ impl Node {
                             }
                         };
 
-                        let signature: RecoverableSignature =
-                            secret_key.sign_digest(Keccak256::new().chain(&typdata));
+                        let signature: RecoverableSignature = SECP256K1.sign_recoverable(
+                            &Message::from_slice(&Keccak256::digest(&typdata)).unwrap(),
+                            &secret_key,
+                        );
 
-                        let mut hashdata = signature.as_bytes().to_vec();
-                        hashdata.append(&mut typdata);
+                        let (rec, sig) = signature.serialize_compact();
+
+                        let hashdata = empty()
+                            .chain(&sig)
+                            .copied()
+                            .chain(once(rec.to_i32() as u8))
+                            .chain(typdata)
+                            .collect::<Vec<u8>>();
 
                         let hash = keccak256(&hashdata);
 
@@ -429,14 +436,11 @@ impl Node {
                                     );
                                 }
 
-                                let rec_id = RecoveryId::new(buf[96])?;
-                                let rec_sig = RecoverableSignature::new(
-                                    &Signature::from_bytes(&buf[32..96])?,
-                                    rec_id,
-                                )?;
-                                let public_key = rec_sig.recover_verify_key_from_digest(
-                                    Keccak256::new().chain(&buf[97..]),
-                                )?;
+                                let rec_id = RecoveryId::from_i32(buf[96] as i32)?;
+                                let rec_sig =
+                                    RecoverableSignature::from_compact(&buf[32..96], rec_id)?;
+                                let public_key =
+                                    SECP256K1.recover(&keccak256_message(&buf[97..]), &rec_sig)?;
                                 let remote_id = pk2id(&public_key);
 
                                 if remote_id == id {
