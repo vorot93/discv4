@@ -1,5 +1,6 @@
 use crate::{kad::*, message::*, proto::*, util::*, NodeId};
 use anyhow::{anyhow, bail};
+use bytes::{BufMut, BytesMut};
 use chrono::Utc;
 use fixed_hash::rustc_hex::FromHexError;
 use futures_util::future::join_all;
@@ -8,7 +9,7 @@ use num_traits::FromPrimitive;
 use parking_lot::{Mutex, RwLock};
 use primitive_types::H256;
 use rand::{distributions::Standard, prelude::SliceRandom, thread_rng, Rng};
-use rlp::Rlp;
+use rlp::{Rlp, RlpStream};
 use secp256k1::{
     recovery::{RecoverableSignature, RecoveryId},
     Message, PublicKey, SecretKey, SECP256K1,
@@ -17,7 +18,6 @@ use sha3::{Digest, Keccak256};
 use std::{
     collections::{btree_map, hash_map, BTreeMap, HashMap},
     convert::TryFrom,
-    iter::{empty, once},
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
@@ -302,42 +302,56 @@ impl Node {
 
                         let mut pre_trigger = None;
                         let mut post_trigger = None;
-                        let typdata: Vec<u8> = match message {
+
+                        let mut datagram = BytesMut::with_capacity(MAX_PACKET_SIZE);
+                        let mut sig_bytes = datagram.split_off(H256::len_bytes());
+                        let mut payload =
+                            sig_bytes.split_off(secp256k1::constants::COMPACT_SIGNATURE_SIZE + 1);
+                        match message {
                             EgressMessage::Ping(message, sender) => {
                                 pre_trigger = Some(PreTrigger::Ping(sender));
                                 post_trigger = Some(PostSendTrigger::Ping);
-                                once(1).chain(rlp::encode(&message)).collect()
+                                payload.put_u8(1);
+                                let mut s = RlpStream::new_with_buffer(payload.split_off(1));
+                                s.append(&message);
+                                payload.unsplit(s.out());
                             }
                             EgressMessage::Pong(message) => {
-                                once(2).chain(rlp::encode(&message)).collect()
+                                payload.put_u8(2);
+                                let mut s = RlpStream::new_with_buffer(payload.split_off(1));
+                                s.append(&message);
+                                payload.unsplit(s.out());
                             }
                             EgressMessage::FindNode(message) => {
-                                once(3).chain(rlp::encode(&message)).collect()
+                                payload.put_u8(3);
+                                let mut s = RlpStream::new_with_buffer(payload.split_off(1));
+                                s.append(&message);
+                                payload.unsplit(s.out());
                             }
                             EgressMessage::Neighbours(message) => {
-                                once(4).chain(rlp::encode(&message)).collect()
+                                payload.put_u8(4);
+                                let mut s = RlpStream::new_with_buffer(payload.split_off(1));
+                                s.append(&message);
+                                payload.unsplit(s.out());
                             }
-                        };
+                        }
 
                         let signature: RecoverableSignature = SECP256K1.sign_recoverable(
-                            &Message::from_slice(&Keccak256::digest(&typdata)).unwrap(),
+                            &Message::from_slice(&Keccak256::digest(&payload)).unwrap(),
                             &secret_key,
                         );
 
                         let (rec, sig) = signature.serialize_compact();
+                        sig_bytes.extend_from_slice(&sig);
+                        sig_bytes.put_u8(rec.to_i32() as u8);
 
-                        let hashdata = empty()
-                            .chain(&sig)
-                            .copied()
-                            .chain(once(rec.to_i32() as u8))
-                            .chain(typdata)
-                            .collect::<Vec<u8>>();
+                        sig_bytes.unsplit(payload);
 
-                        let hash = keccak256(&hashdata);
+                        let hash = keccak256(&sig_bytes);
 
-                        let mut datagram = Vec::with_capacity(MAX_PACKET_SIZE);
                         datagram.extend_from_slice(hash.as_bytes());
-                        datagram.extend_from_slice(&hashdata);
+
+                        datagram.unsplit(sig_bytes);
 
                         let mut do_send = false;
                         match pre_trigger {
@@ -362,7 +376,6 @@ impl Node {
 
                         if let Err(e) = udp.send_to(&datagram, addr).await {
                             warn!("UDP socket send failure: {}", e);
-                            return;
                         } else if let Some(trigger) = post_trigger {
                             match trigger {
                                 PostSendTrigger::Ping => {
