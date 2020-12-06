@@ -2,7 +2,6 @@ use crate::{kad::*, message::*, proto::*, util::*, NodeId};
 use anyhow::{anyhow, bail};
 use bytes::{BufMut, BytesMut};
 use chrono::Utc;
-use fixed_hash::rustc_hex::FromHexError;
 use futures_util::future::join_all;
 use igd::aio::search_gateway;
 use num_traits::FromPrimitive;
@@ -120,7 +119,7 @@ impl FromStr for NodeRecord {
         let id = url
             .username()
             .parse()
-            .map_err(|e: FromHexError| NodeRecordParseError::InvalidId(e.into()))?;
+            .map_err(|e| NodeRecordParseError::InvalidId(anyhow::Error::from(e)))?;
 
         Ok(Self {
             address,
