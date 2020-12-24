@@ -26,14 +26,12 @@ use task_group::TaskGroup;
 use thiserror::Error;
 use tokio::{
     net::UdpSocket,
-    stream::StreamExt,
     sync::{
         mpsc::{channel, Sender},
         oneshot::{channel as oneshot, Sender as OneshotSender},
     },
     time::{sleep, timeout},
 };
-use tokio_compat_02::FutureExt;
 use tracing::*;
 use url::{Host, Url};
 
@@ -244,7 +242,6 @@ impl Node {
                                     .await?,
                             )
                         }
-                        .compat()
                         .await
                         {
                             Ok(v) => {
@@ -291,7 +288,7 @@ impl Node {
             let inflight_ping_requests = inflight_ping_requests.clone();
             let udp = udp.clone();
             async move {
-                while let Some((addr, peer, message)) = egress_requests.next().await {
+                while let Some((addr, peer, message)) = egress_requests.recv().await {
                     async {
                         if peer == id {
                             return;
@@ -774,7 +771,7 @@ impl Node {
                         // In case the node wants to ping us, give it an opportunity to do so
                         let _ = timeout(QUERY_AWAIT_PING_TIME, expected_ping_rx).await;
 
-                        let (tx, rx) = channel(1);
+                        let (tx, mut rx) = channel(1);
                         let _guard = inflight_find_node_requests.add(node.record.id, tx);
                         egress_requests_tx
                             .send((
@@ -793,8 +790,9 @@ impl Node {
                         // ...and await for Neighbours response
                         let mut received_neighbours = Vec::new();
 
-                        let mut rx = rx.timeout(NEIGHBOURS_WAIT_TIMEOUT);
-                        while let Ok(neighbours) = rx.try_next().await {
+                        while let Ok(neighbours) =
+                            tokio::time::timeout(NEIGHBOURS_WAIT_TIMEOUT, rx.recv()).await
+                        {
                             received_neighbours.push(
                                 neighbours
                                     .expect("we drop the sending channel, not the ingress router"),
