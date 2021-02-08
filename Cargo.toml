@@ -25,7 +25,7 @@ igd = { version = "0.12", features = ["aio"] }
 num-traits = "0.2"
 parking_lot = "0.11"
 plain_hasher = "0.2"
-primitive-types = { version = "0.8", features = ["rlp"] }
+primitive-types = { version = "0.9", features = ["rlp"] }
 rand = "0.8"
 rlp = "0.5"
 rlp-derive = "0.1"
